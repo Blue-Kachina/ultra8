@@ -248,22 +248,95 @@ function is_chan_selected(idx) (
     ((cfgp_link[]&(1<<(idx>>1))) && g_chan_selected == idx~1);
 );
 
+// ── Pair helper functions ─────────────────────────────────────────────────────
+// Returns non-zero if idx belongs to a linked pair.
+function is_linked_idx(idx) (
+  cfgp_link[] & (1 << (idx >> 1));
+);
+
+// Returns the owner (even-numbered) lane index for any lane in a linked pair,
+// or idx itself when not linked.
+function pair_owner_idx(idx) (
+  is_linked_idx(idx) ? (idx & -2) : idx;
+);
+
+// Returns the partner lane index (idx XOR 1) when linked, -1 otherwise.
+function pair_partner_idx(idx) (
+  is_linked_idx(idx) ? (idx ~ 1) : -1;
+);
+
+// Returns a pointer to the owner lane's state record.
+function pair_owner_rec(idx) (
+  mem_stlist + pair_owner_idx(idx) * st_num;
+);
+
+// Returns a pointer to the partner lane's state record, or -1 when unlinked.
+function pair_partner_rec(idx) local(p) (
+  p = pair_partner_idx(idx);
+  p >= 0 ? mem_stlist + p * st_num : -1;
+);
+// ─────────────────────────────────────────────────────────────────────────────
+
 function setstate_for_rec(rec, state) (
   rec = (rec-mem_stlist)/st_num;
   <? loop(x=0;nch, printf("rec == %d ? ch%d.setstate(state) :\n",x,x+1); x+=1) ?> 0;
 );
 
-function play_or_stop_all() local(want_state rec)
+// ── Pair-aware command wrappers ───────────────────────────────────────────────
+// Apply a state transition to both lanes of a pair (or just the one if unlinked).
+// Resolves idx to the pair owner before dispatching.
+function setstate_pair(idx, state) local(oidx pidx) (
+  oidx = pair_owner_idx(idx);
+  pidx = pair_partner_idx(oidx);
+  setstate_for_rec(mem_stlist + oidx * st_num, state);
+  pidx >= 0 ? setstate_for_rec(mem_stlist + pidx * st_num, state);
+);
+
+// Save pre-overdub undo snapshot for both lanes of a pair.
+function snapshot_pair(idx) local(oidx pidx orec prec) (
+  oidx = pair_owner_idx(idx);
+  pidx = pair_partner_idx(oidx);
+  orec = mem_stlist + oidx * st_num;
+  orec[st_state] == 1 && orec[st_dirty] > 0 && orec[st_dirty] <= g_maxlen ? (
+    memcpy(orec[st_undo_buf], orec[st_buf], orec[st_dirty]);
+    orec[st_undo_len] = orec[st_dirty];
+  );
+  pidx >= 0 ? (
+    prec = mem_stlist + pidx * st_num;
+    prec[st_state] == 1 && prec[st_dirty] > 0 && prec[st_dirty] <= g_maxlen ? (
+      memcpy(prec[st_undo_buf], prec[st_buf], prec[st_dirty]);
+      prec[st_undo_len] = prec[st_dirty];
+    );
+  );
+);
+
+// Canonicalize g_chan_selected to the pair owner when linked.
+function select_pair(idx) (
+  g_chan_selected = pair_owner_idx(idx);
+);
+// ─────────────────────────────────────────────────────────────────────────────
+
+function play_or_stop_all() local(want_state rec i)
 (
   want_state = 0;
+  i = 0;
   rec = mem_stlist;
   loop(g_nchan,
-    rec[st_state] != 1 && rec[st_dirty]>0 ? want_state = 1;
+    // Skip partner lanes when evaluating desired play state
+    !(is_linked_idx(i) && (i & 1)) ? (
+      rec[st_state] != 1 && rec[st_dirty]>0 ? want_state = 1;
+    );
     rec += st_num;
+    i += 1;
   );
+  i = g_nchan;
   loop(g_nchan,
+    i -= 1;
     rec -= st_num;
-    rec[st_state] != want_state && (rec[st_dirty]>0||rec[st_state]) ? setstate_for_rec(rec,want_state);
+    // Apply via setstate_pair; skip partner lanes to avoid double-apply
+    !(is_linked_idx(i) && (i & 1)) ? (
+      rec[st_state] != want_state && (rec[st_dirty]>0||rec[st_state]) ? setstate_pair(i, want_state);
+    );
   );
 );
 
@@ -382,6 +455,37 @@ function reverse() instance(rec) local(l)
   rec[st_lastd] = -1;
 );
 
+// Reverse both lanes of a pair (or just the one if unlinked).
+// Defined here (after reverse + rev_stop) to avoid forward-reference errors.
+function reverse_pair(idx) local(oidx pidx) (
+  oidx = pair_owner_idx(idx);
+  <? loop(x=0;nch, printf("oidx == %d ? ch%d.reverse() :\n",x,x+1); x+=1;) ?> 0;
+  (pidx = pair_partner_idx(oidx)) >= 0 ? (
+    <? loop(x=0;nch, printf("pidx == %d ? ch%d.reverse() :\n",x,x+1); x+=1;) ?> 0;
+  );
+);
+
+// Clear both lanes of a pair: stop, zero buffer, drop undo snapshot.
+// Defined here (after rev_stop) to avoid forward-reference errors.
+function clear_pair(idx) local(oidx pidx orec prec) (
+  oidx = pair_owner_idx(idx);
+  pidx = pair_partner_idx(oidx);
+  orec = mem_stlist + oidx * st_num;
+  // Clear owner
+  <? loop(x=0;nch, printf("oidx == %d ? (ch%d.setstate(0); ch%d.rev_stop(); ch%d.dirty_top=-1;) :\n",x,x+1,x+1,x+1); x+=1;) ?> 0;
+  orec[st_dirty] > 0 ? memset(orec[st_buf], 0, orec[st_dirty]);
+  orec[st_dirty] = 0;
+  orec[st_undo_len] = 0;
+  // Clear partner when linked
+  pidx >= 0 ? (
+    prec = mem_stlist + pidx * st_num;
+    <? loop(x=0;nch, printf("pidx == %d ? (ch%d.setstate(0); ch%d.rev_stop(); ch%d.dirty_top=-1;) :\n",x,x+1,x+1,x+1); x+=1;) ?> 0;
+    prec[st_dirty] > 0 ? memset(prec[st_buf], 0, prec[st_dirty]);
+    prec[st_dirty] = 0;
+    prec[st_undo_len] = 0;
+  );
+);
+
 function onmsg(m1,m2,m3) instance(rec,note,note2,note3,note4)
   local(newstate)
 (
@@ -391,14 +495,13 @@ function onmsg(m1,m2,m3) instance(rec,note,note2,note3,note4)
    ) : m2 == note2  || m2 == 1024+rec+st_note2 ? (
      newstate = rec[st_state] == 2 || (rec[st_state]==0 && g_length) ? 1 : 0
    ) : (m2 == note3 || m2 == 1024+rec+st_note3) ? (
-     g_chan_selected = (g_chan_selected == this.idx) ? -1 : this.idx;
+     g_chan_selected = is_chan_selected(this.idx) ? -1 : pair_owner_idx(this.idx);
    ) : m2 == note4 || m2 == 1024+rec+st_note4 ? (
-     this.reverse();
+     reverse_pair(this.idx);
    );
    newstate >= 0 ? (
-     this.setstate(newstate);
-     setstate_for_rec(get_linked_rec(this.idx), newstate);
-     g_chan_selected = this.idx;
+     setstate_pair(this.idx, newstate);
+     select_pair(this.idx);
    );
 );
 
@@ -472,6 +575,28 @@ function adjustsizes(scale, repup) local(nlen,olen, lp, l, offs, nlen2)
 function updatechfromrec()
 (
   <? loop(x=0;nch,printf("ch%d.updatefromrec();\n",x+=1)) ?>
+);
+
+// Restore the undo snapshot for both lanes of a pair.
+// Defined here (after updatechfromrec) to avoid a forward-reference error.
+function undo_pair(idx) local(oidx pidx orec prec) (
+  oidx = pair_owner_idx(idx);
+  pidx = pair_partner_idx(oidx);
+  orec = mem_stlist + oidx * st_num;
+  orec[st_undo_len] > 0 ? (
+    memcpy(orec[st_buf], orec[st_undo_buf], orec[st_undo_len]);
+    orec[st_dirty] = orec[st_undo_len];
+    <? loop(x=0;nch, printf("oidx == %d ? ch%d.dirty_top = orec[st_undo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
+  );
+  pidx >= 0 ? (
+    prec = mem_stlist + pidx * st_num;
+    prec[st_undo_len] > 0 ? (
+      memcpy(prec[st_buf], prec[st_undo_buf], prec[st_undo_len]);
+      prec[st_dirty] = prec[st_undo_len];
+      <? loop(x=0;nch, printf("pidx == %d ? ch%d.dirty_top = prec[st_undo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
+    );
+  );
+  updatechfromrec();
 );
 
 function reset() local(lp)
@@ -830,35 +955,23 @@ while (sidx == nextmsg_offs)
       mem_stlist[g_cmn_i*st_num + st_midichan] == g_msg_chan ? (
         g_cmn_rec = mem_stlist + g_cmn_i*st_num;
         nextmsg_2 == cfgp_common_rec[] ? (
-          // Snapshot before overdub: save buffer state when lane is playing with content
-          g_cmn_rec[st_state] == 1 && g_cmn_rec[st_dirty] > 0 && g_cmn_rec[st_dirty] <= g_maxlen ? (
-            memcpy(g_cmn_rec[st_undo_buf], g_cmn_rec[st_buf], g_cmn_rec[st_dirty]);
-            g_cmn_rec[st_undo_len] = g_cmn_rec[st_dirty];
-          );
-          nextmsg_2 = 1024 + g_cmn_rec + st_note1;
+          // Snapshot before overdub (pair-aware: saves both lanes when linked)
+          snapshot_pair(g_cmn_i);
+          // Redirect note to pair owner so REC always hits the owner lane
+          nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note1;
         ) :
         nextmsg_2 == cfgp_common_clr[] ? (
-          // Clear lane: stop playback, zero buffer, invalidate undo snapshot
-          g_cmn_clr = g_cmn_i;
-          <? loop(x=0;nch, printf("g_cmn_clr == %d ? (ch%d.setstate(0); ch%d.rev_stop(); ch%d.dirty_top=-1;) :\n",x,x+1,x+1,x+1); x+=1;) ?> 0;
-          g_cmn_rec[st_dirty] > 0 ? memset(g_cmn_rec[st_buf], 0, g_cmn_rec[st_dirty]);
-          g_cmn_rec[st_dirty] = 0;
-          g_cmn_rec[st_undo_len] = 0;
+          // Clear lane(s): pair-aware — stops, zeros buffer, drops undo snapshot
+          clear_pair(g_cmn_i);
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == cfgp_common_ply[] ? nextmsg_2 = 1024 + g_cmn_rec + st_note2 :
+        nextmsg_2 == cfgp_common_ply[] ? nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note2 :
         nextmsg_2 == cfgp_common_undo[] ? (
-          // Undo: restore pre-overdub snapshot if available
-          g_cmn_rec[st_undo_len] > 0 ? (
-            memcpy(g_cmn_rec[st_buf], g_cmn_rec[st_undo_buf], g_cmn_rec[st_undo_len]);
-            g_cmn_rec[st_dirty] = g_cmn_rec[st_undo_len];
-            g_cmn_drt = g_cmn_i;
-            <? loop(x=0;nch, printf("g_cmn_drt == %d ? ch%d.dirty_top = g_cmn_rec[st_undo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
-            updatechfromrec();
-          );
+          // Undo: pair-aware — restores both lanes when linked
+          undo_pair(g_cmn_i);
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == cfgp_common_sel[] ? nextmsg_2 = 1024 + g_cmn_rec + st_note3 :
+        nextmsg_2 == cfgp_common_sel[] ? nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note3 :
         nextmsg_2 == cfgp_common_mon[] ? (
           // Mon: cycle immediately (not latched); suppress normal dispatch
           g_cmn_rec[st_monmode] = (g_cmn_rec[st_monmode]+1)%3;
@@ -1001,6 +1114,9 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
         t = min(max(midimem[0] - tw,1),64);
         midimem[0] != t ? (
           midimem[0] = t;
+          // Propagate to linked partner
+          rec2 = get_linked_rec(((midimem-mem_stlist)/st_num)|0);
+          rec2 >= 0 ? rec2[st_div] = t;
           updatechfromrec();
           draw=1;
           lastchanlink |= (1<<40); // trigger redraw
@@ -1065,7 +1181,7 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
             g_inject_midinote = 1024+midimem;
           ) : (
             t = ((midimem-mem_stlist)/st_num)|0;
-            <? loop(x=0;nch, printf("t == %d ? ch%d.reverse() :\n",x,x+1); x+=1;) ?> 0;
+            reverse_pair(t);
           );
         ) : t == st_fade_size ? (
           midimem[0] = midimem[0] ? -midimem[0] : 1;
@@ -1395,8 +1511,21 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       // Link button hit zone: right 22px, spanning both lanes of a pair
       (i&1) && mouse_in(gfx_w - 25, row_y - lane_h, 25, lane_h*2) ? (
         cfgp_link[] ~= 1<<(i>>1);
+        // Phase 3: when just linked, normalize partner state from owner
+        cfgp_link[] & (1<<(i>>1)) ? (
+          // rec points to partner (i, odd); rec2 = owner (i-1, even)
+          rec2 = mem_stlist + (i-1) * st_num;
+          rec[st_state]     = rec2[st_state];
+          rec[st_monmode]   = rec2[st_monmode];
+          rec[st_rdc]       = rec2[st_rdc];
+          rec[st_div]       = rec2[st_div];
+          rec[st_fade_size] = rec2[st_fade_size];
+          updatechfromrec();
+          // Canonicalize selection: if partner was selected, redirect to owner
+          g_chan_selected == i ? g_chan_selected = i - 1;
+        );
       ) : mouse_in(state_x, row_y, gfx_w - 22, lane_h) ? (
-        g_chan_selected = i;
+        select_pair(i);
       );
     );
 
@@ -1491,21 +1620,42 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     // Sub-controls (right-aligned: CH | RDC DIV FAD | speaker)
     t = mem_stlist + i * st_num;
     t_ypos = row_cy - (tweaker_h / 2)|0;
-    draw_value_tweaker(rdc_x, t_ypos, t + st_rdc, wantr, "RDC");
-    div_x >= 0 ? draw_value_tweaker(div_x, t_ypos, t + st_div, wantr, "DIV");
-    fad_x >= 0 ? draw_value_tweaker(fad_x, t_ypos, t + st_fade_size, wantr, "FAD");
-
-    // MIDI input tweakers (CH or per-note, right-aligned)
-    g_common ? (
-      ch_x >= 0 ? draw_value_tweaker(ch_x, t_ypos, t + st_midichan, wantr, "CH");
+    // Phase 5: partner lanes in a linked pair show a "linked" label instead of
+    // independent controls, to avoid implying they can be commanded separately.
+    is_linked_idx(i) && (i & 1) ? (
+      // Partner lane — draw a dimmed placeholder where the tweakers would be
+      wantr ? (
+        gfx_set(0.18, 0.18, 0.28);
+        rdc_x >= 0 ? gfx_rect(rdc_x, t_ypos, tweaker_w, tweaker_h);
+        div_x >= 0 ? gfx_rect(div_x, t_ypos, tweaker_w, tweaker_h);
+        fad_x >= 0 ? gfx_rect(fad_x, t_ypos, tweaker_w, tweaker_h);
+        gfx_set(0.38, 0.38, 0.55);
+        gfx_setfont(1,"Arial",9);
+        gfx_measurestr("linked",tw,th);
+        gfx_x = rdc_x + (tweaker_w - tw) * 0.5;
+        gfx_y = t_ypos + (tweaker_h - th) * 0.5;
+        gfx_drawstr("linked");
+        gfx_setfont(0);
+      );
+      // MIDI tweakers: show CH only (informational), skip note-assignment controls
+      g_common && ch_x >= 0 ? draw_value_tweaker(ch_x, t_ypos, t + st_midichan, wantr, "CH");
     ) : (
-      lx = ch_x >= 0 ? ch_x : rdc_x - (tweaker_w + gap) * 4;
-      lx += draw_value_tweaker(lx, t_ypos, t + st_note1, wantr,
-              rec[st_state]==2 && !g_firstrec ? "PLY" : "REC") + gap;
-      lx += draw_value_tweaker(lx, t_ypos, t + st_note2, wantr,
-              rec[st_state]==1 ? "STP" : "PLY") + gap;
-      lx += draw_value_tweaker(lx, t_ypos, t + st_note3, wantr, "SEL") + gap;
-      draw_value_tweaker(lx, t_ypos, t + st_note4, wantr, "REV");
+      draw_value_tweaker(rdc_x, t_ypos, t + st_rdc, wantr, "RDC");
+      div_x >= 0 ? draw_value_tweaker(div_x, t_ypos, t + st_div, wantr, "DIV");
+      fad_x >= 0 ? draw_value_tweaker(fad_x, t_ypos, t + st_fade_size, wantr, "FAD");
+
+      // MIDI input tweakers (CH or per-note, right-aligned)
+      g_common ? (
+        ch_x >= 0 ? draw_value_tweaker(ch_x, t_ypos, t + st_midichan, wantr, "CH");
+      ) : (
+        lx = ch_x >= 0 ? ch_x : rdc_x - (tweaker_w + gap) * 4;
+        lx += draw_value_tweaker(lx, t_ypos, t + st_note1, wantr,
+                rec[st_state]==2 && !g_firstrec ? "PLY" : "REC") + gap;
+        lx += draw_value_tweaker(lx, t_ypos, t + st_note2, wantr,
+                rec[st_state]==1 ? "STP" : "PLY") + gap;
+        lx += draw_value_tweaker(lx, t_ypos, t + st_note3, wantr, "SEL") + gap;
+        draw_value_tweaker(lx, t_ypos, t + st_note4, wantr, "REV");
+      );
     );
 
     // Monitor right-click: cycle 3 modes
