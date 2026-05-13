@@ -693,6 +693,7 @@ ext_noinit == 0 ? (
   mem_stlist = alloc(g_nchan * st_num);
 
   g_inject_midinote = 0;
+  g_ui_dispatch = 0;  // set to 1 when a UI-injected command is pre-loaded, so it bypasses the common-mode gate
   g_common = 1;       // common mode: on by default (synced from mem_gen_cfg[21] after serialize)
   g_mon_changed = 0;  // flag: monmode changed in @sample, sliderchange needed from @gfx
   g_msg_chan = 1;     // last received MIDI channel (1-16)
@@ -843,8 +844,10 @@ g_inject_midinote >= 1024 ? (
   nextmsg_1=0x90;
   nextmsg_2=g_inject_midinote;
   nextmsg_3=127;
+  g_ui_dispatch = 1;  // UI-generated: must bypass the common-mode raw-MIDI block
   g_inject_midinote=0;
 ) : (
+  g_ui_dispatch = 0;
   midirecv(nextmsg_offs,nextmsg_1,nextmsg_2,nextmsg_3) ? midisend(nextmsg_offs,nextmsg_1,nextmsg_2,nextmsg_3);
 );
 
@@ -1003,7 +1006,7 @@ while (sidx == nextmsg_offs)
     // only translated common commands (common_dispatch=1) reach chan_onmsg / latch queue.
     // Raw per-lane assignments are blocked while g_common is enabled (Option A).
     // Global controls (reset, halve, etc.) are checked below regardless of common mode.
-    (!g_common || common_dispatch) ? (
+    (!g_common || common_dispatch || g_ui_dispatch) ? (
       (!g_latchmode || g_pos == 0 || g_firstrec) ? (
         chan_onmsg(nextmsg_1,nextmsg_2,nextmsg_3);
       ) : (
@@ -1239,7 +1242,7 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
         do_overlay = do_overlay==1?"CC":"PC";
         gfx_measurestr(do_overlay,tw,th);
         gfx_y=ypos + (lbl?(40-th):(42-th)*.5)- 4;
-        gfx_x=xpos + max(0,(w-tw)*.5 - 3);
+        gfx_x=xpos + (w-tw)*.5;
         do_overlay=="CC" ? gfx_set(0.9,.5,.2) : gfx_set(0.5,.5,.9);
         gfx_drawstr(do_overlay);
         do_overlay=3;
@@ -1248,7 +1251,7 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
     );
     gfx_measurestr(t,tw,th);
     gfx_y=ypos + min((lbl?(40-th):(42-th)*.5) + do_overlay, 42-th);
-    gfx_x=xpos + min((w-tw)*.5 + do_overlay, w-tw);
+    gfx_x=xpos + (w-tw)*.5;
     gfx_set(0.1);
     gfx_drawstr(t);
     lbl ? (
@@ -1396,7 +1399,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   g_curpk g_curpk_h
   lasthalve lastlen lastoffs lastchanlink
   tweaker_w tweaker_h link_area_w extra_gap content_right r_pos
-  mon_sz fad_x div_x rdc_x ch_x t_ypos)
+  mon_sz fad_x div_x rdc_x ch_x t_ypos
+  state_hover own_rec id_text)
 (
   force_redraw = gfx_w != last_w || gfx_h != last_h ||
     lasthalve != cfgp_fade[] || lastlen != g_length ||
@@ -1436,49 +1440,14 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
 
     tx = ixpos + gap;
 
-    // rec — standard purple
-    force_redraw ? (
-      PR.Color.Panel = "2A1F50FF"; PR.Color.Contour = "5050A0FF";
-      PR.DisplayPanel((tx + 23) / pr_s * 100, (ypos + 27) / pr_s * 100, 47 / pr_s * 100, 46 / pr_s * 100);
-    );
-    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_rec, force_redraw, "REC") + gap;
-
-    // clr — warm amber-brown (destructive action)
-    force_redraw ? (
-      PR.Color.Panel = "3D2010FF"; PR.Color.Contour = "B05020FF";
-      PR.DisplayPanel((tx + 23) / pr_s * 100, (ypos + 27) / pr_s * 100, 47 / pr_s * 100, 46 / pr_s * 100);
-    );
-    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_clr, force_redraw, "CLR") + gap;
+    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_rec,  force_redraw, "REC")  + gap;
+    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_clr,  force_redraw, "CLR")  + gap;
     tx += 8;
-
-    // ply — standard purple
-    force_redraw ? (
-      PR.Color.Panel = "2A1F50FF"; PR.Color.Contour = "5050A0FF";
-      PR.DisplayPanel((tx + 23) / pr_s * 100, (ypos + 27) / pr_s * 100, 47 / pr_s * 100, 46 / pr_s * 100);
-    );
-    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_ply, force_redraw, "PLY") + gap;
-
-    // undo — green tint (restorative action)
-    force_redraw ? (
-      PR.Color.Panel = "1A3020FF"; PR.Color.Contour = "30A040FF";
-      PR.DisplayPanel((tx + 23) / pr_s * 100, (ypos + 27) / pr_s * 100, 47 / pr_s * 100, 46 / pr_s * 100);
-    );
+    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_ply,  force_redraw, "PLY")  + gap;
     tx += draw_value_tweaker(tx, ypos+6, cfgp_common_undo, force_redraw, "UNDO") + gap;
     tx += 8;
-
-    // sel — standard purple
-    force_redraw ? (
-      PR.Color.Panel = "2A1F50FF"; PR.Color.Contour = "5050A0FF";
-      PR.DisplayPanel((tx + 23) / pr_s * 100, (ypos + 27) / pr_s * 100, 47 / pr_s * 100, 46 / pr_s * 100);
-    );
-    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_sel, force_redraw, "SEL") + gap;
-
-    // mon — standard purple
-    force_redraw ? (
-      PR.Color.Panel = "2A1F50FF"; PR.Color.Contour = "5050A0FF";
-      PR.DisplayPanel((tx + 23) / pr_s * 100, (ypos + 27) / pr_s * 100, 47 / pr_s * 100, 46 / pr_s * 100);
-    );
-    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_mon, force_redraw, "MON") + gap;
+    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_sel,  force_redraw, "SEL")  + gap;
+    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_mon,  force_redraw, "MON")  + gap;
     ypos += 56;
   );
 
@@ -1499,8 +1468,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   state_x = ixpos;
   content_right = gfx_w - link_area_w;
 
-  // Speaker size: fill lane height (capped at 36)
-  mon_sz = max(min(lane_h - 6, 36), 16);
+  // Speaker size: match tweaker_h; shrink gracefully only if lane is compressed
+  mon_sz = min(tweaker_h, max(lane_h - 6, 16));
 
   // Build right-side positions from right edge inward
   // extra_gap on both sides of speaker (mirrors gap to left of speaker)
@@ -1542,7 +1511,10 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
           // Canonicalize selection: if partner was selected, redirect to owner
           g_chan_selected == i ? g_chan_selected = i - 1;
         );
-      ) : mouse_in(state_x, row_y, gfx_w - 22, lane_h) ? (
+      ) : mouse_in(state_x, row_y, state_w, lane_h) ? (
+        // Lane identifier click: inject PLY/STP toggle for the pair owner
+        g_inject_midinote = 1024 + pair_owner_rec(i) + st_note2;
+      ) : mouse_in(state_x + state_w, row_y, gfx_w - 22 - state_w, lane_h) ? (
         select_pair(i);
       );
     );
@@ -1581,13 +1553,22 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
                            gfx_set(0x25/255.0, 0x25/255.0, 0x30/255.0);
       gfx_rect(state_x + 2, row_y + 2, state_w - 2, lane_h - 4);
 
-      // Lane number (left portion of container)
+      // Lane number / hover play-stop symbol (left portion of container)
       PR.Color.Text = "FFFFFFFF";
+      state_hover = mouse_in(state_x, row_y, state_w, lane_h);
+      own_rec = pair_owner_rec(i);
+      state_hover ? (
+        own_rec[st_state] == 1 ? id_text = "■" :
+        own_rec[st_dirty]  > 0 ? id_text = "▶" :
+                                  id_text = sprintf(#, "%d", i+1);
+      ) : (
+        id_text = sprintf(#, "%d", i+1);
+      );
       PR.DisplayText(
         (state_x + state_w*0.5) / pr_s * 100,
         (row_y + lane_h*0.5) / pr_s * 100,
         3.5,
-        sprintf(#, "%d", i+1)
+        id_text
       );
 
       // Waveform sub-panel — inset 2 px top/bottom so the PR contour border
@@ -1655,8 +1636,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
         gfx_drawstr("linked");
         gfx_setfont(0);
       );
-      // MIDI tweakers: show CH only (informational), skip note-assignment controls
-      g_common && ch_x >= 0 ? draw_value_tweaker(ch_x, t_ypos, t + st_midichan, wantr, "CH");
+      // Partner lane has no independent MIDI controls (owner lane controls the pair)
     ) : (
       draw_value_tweaker(rdc_x, t_ypos, t + st_rdc, wantr, "RDC");
       div_x >= 0 ? draw_value_tweaker(div_x, t_ypos, t + st_div, wantr, "DIV");
