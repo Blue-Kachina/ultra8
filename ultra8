@@ -947,6 +947,11 @@ while (sidx == nextmsg_offs)
   (nextmsg_1 & 0xF0) == 0xB0 && nextmsg_3 >= 1 ? ( nextmsg_1 = 0x90 | (nextmsg_1 & 0x0F); nextmsg_2 += 129; ) :
   (nextmsg_1 & 0xF0) == 0xC0 ? ( nextmsg_1 = 0x90 | (nextmsg_1 & 0x0F); nextmsg_2 += 129*2; nextmsg_3=127; );
 
+  // Tracks whether a common-mode message was translated into an internal lane command
+  // and should be forwarded to chan_onmsg / latch queue.
+  // Reset each message; set to 1 in REC/PLY/SEL branches below.
+  common_dispatch = 0;
+
   // Common mode: resolve global assignments to per-lane inject form BEFORE latch check,
   // so the latch queue stores resolved values (correct lane, not the global note).
   (nextmsg_1 & 0xF0) == 0x90 && nextmsg_3 != 0 && g_common ? (
@@ -959,19 +964,26 @@ while (sidx == nextmsg_offs)
           snapshot_pair(g_cmn_i);
           // Redirect note to pair owner so REC always hits the owner lane
           nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note1;
+          common_dispatch = 1; // translated: allow lane dispatch
         ) :
         nextmsg_2 == cfgp_common_clr[] ? (
           // Clear lane(s): pair-aware — stops, zeros buffer, drops undo snapshot
           clear_pair(g_cmn_i);
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == cfgp_common_ply[] ? nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note2 :
+        nextmsg_2 == cfgp_common_ply[] ? (
+          nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note2;
+          common_dispatch = 1; // translated: allow lane dispatch
+        ) :
         nextmsg_2 == cfgp_common_undo[] ? (
           // Undo: pair-aware — restores both lanes when linked
           undo_pair(g_cmn_i);
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == cfgp_common_sel[] ? nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note3 :
+        nextmsg_2 == cfgp_common_sel[] ? (
+          nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note3;
+          common_dispatch = 1; // translated: allow lane dispatch
+        ) :
         nextmsg_2 == cfgp_common_mon[] ? (
           // Mon: cycle immediately (not latched); suppress normal dispatch
           g_cmn_rec[st_monmode] = (g_cmn_rec[st_monmode]+1)%3;
@@ -987,12 +999,18 @@ while (sidx == nextmsg_offs)
   );
 
   (nextmsg_1 & 0xF0) == 0x90 && nextmsg_3 != 0  ? (
-    (!g_latchmode || g_pos == 0 || g_firstrec) ? (
-      chan_onmsg(nextmsg_1,nextmsg_2,nextmsg_3);    
-    ) : (
-      latchq_add(nextmsg_1,nextmsg_2,nextmsg_3);
+    // Lane dispatch is exclusive when common mode is on:
+    // only translated common commands (common_dispatch=1) reach chan_onmsg / latch queue.
+    // Raw per-lane assignments are blocked while g_common is enabled (Option A).
+    // Global controls (reset, halve, etc.) are checked below regardless of common mode.
+    (!g_common || common_dispatch) ? (
+      (!g_latchmode || g_pos == 0 || g_firstrec) ? (
+        chan_onmsg(nextmsg_1,nextmsg_2,nextmsg_3);
+      ) : (
+        latchq_add(nextmsg_1,nextmsg_2,nextmsg_3);
+      );
     );
-    
+
     nextmsg_2 == cfgp_reset[]        ? (strlen(#mainthread_todo)<100 ? strcat(#mainthread_todo, "r")) :
     nextmsg_2 == cfgp_halve[]        ? (strlen(#mainthread_todo)<100 ? strcat(#mainthread_todo, "h")) :
     nextmsg_2 == cfgp_double[]       ? (strlen(#mainthread_todo)<100 ? strcat(#mainthread_todo, "d")) :
