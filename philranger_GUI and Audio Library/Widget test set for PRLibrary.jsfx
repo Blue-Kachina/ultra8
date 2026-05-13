@@ -1,0 +1,139 @@
+desc: Widget tests for PRLibrary
+
+import PhilRangerAudioLibraryAlpha5.jsfx-inc
+
+//Load pictures if desired.  They will be referred to by their number.
+filename:0,philranger_GUI and Audio Library/Highlight.png
+filename:1,philranger_GUI and Audio Library/Knob.png
+filename:2,philranger_GUI and Audio Library/Switch.png
+
+slider1:5<1,11,1>1
+slider2:5<1,11,1>2
+slider3:5<1,11,1>3
+slider4:5<1,11,1>4
+slider5:5<1,11,1>5
+slider6:5<1,11,1>6
+slider7:5<1,11,1>7
+slider8:5<1,11,1>8
+slider9:mode=0<0,5,1,{Vertical Sliders, Horizontal Sliders, Switches, Knobs and meters, Rotary Switches}>Test
+
+@init
+  // SliderNumber DefaultValue MinValue MaxValue [Linearity]:
+  mySlider1=PR.NewSlider(1,5,1,11);
+  mySlider2=PR.NewSlider(2,5,1,11);
+  mySlider3=PR.NewSlider(3,5,1,11);
+  mySlider4=PR.NewSlider(4,5,1,11);
+  mySlider5=PR.NewSlider(5,5,1,11,1);
+  mySlider6=PR.NewSlider(6,5,1,11,1);
+  mySlider7=PR.NewSlider(7,5,1,11,1);
+  mySlider8=PR.NewSlider(8,5,1,11,1);
+@slider // No need to do anything here as I used named variables for the slider definitions
+@block
+@sample
+@gfx 600 600
+  (mode==0) ? ( //SliderV
+    PR.SetShape(12,50,8,80); // Center X %, Center Y %, Width % Height %
+    PR.DisplaySlider(mySlider1); // SliderNumber,[PictureNumber].
+
+    PR.DisplaySlider(mySlider2,2,30,50,10,80); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(50,30,8,50); // Center X %, Center Y %, Width % Height %
+    PR.DisplaySlider(mySlider3); // SliderNumber,[PictureNumber].
+
+    PR.DisplaySlider(mySlider4,2,65,60,8,50); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(82,50,8,80); // Center X %, Center Y %, Width % Height %
+    PR.DisplaySlider(mySlider5); // SliderNumber,[PictureNumber].
+
+    PR.DisplaySlider(mySlider6,2,100,50,10,80); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(120,30,8,50); // Center X %, Center Y %, Width % Height %
+    PR.DisplaySlider(mySlider7); // SliderNumber,[PictureNumber].
+
+    PR.DisplaySlider(mySlider8,2,135,60,8,50); // SliderNumber,[PictureNumber].
+  );
+
+  (mode==1) ? ( //SliderH
+    PR.SetShape(50,12,80,8); // Center X %, Center Y %, Width % Height %
+    PR.DisplaySlider(mySlider1); // SliderNumber,[PictureNumber].
+
+    PR.DisplaySlider(mySlider2,1,50,30,80,10); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(30,50,50,8); // Center X %, Center Y %, Width % Height %
+    PR.DisplaySlider(mySlider3); // SliderNumber,[PictureNumber].
+
+    PR.DisplaySlider(mySlider4,1,60,65,50,8); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(50,82,80,8); // Center X %, Center Y %, Width % Height %
+    PR.DisplaySlider(mySlider5); // SliderNumber,[PictureNumber].
+
+    PR.DisplaySlider(mySlider6,1,50,100,80,10); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(30,120,50,8); // Center X %, Center Y %, Width % Height %
+    PR.DisplaySlider(mySlider7); // SliderNumber,[PictureNumber].
+
+    PR.DisplaySlider(mySlider8,1,60,135,50,8); // SliderNumber,[PictureNumber].
+  );
+
+  (mode==2) ? ( //Switches
+    PR.SetShape(12,50,8,16); // Center X %, Center Y %, Width % Height %
+    PR.DisplaySwitch(1); // SliderNumber,[PictureNumber].
+
+    PR.DisplaySwitch(2,1,30,50,10,16); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(50,30,8,16); // Center X %, Center Y %, Width % Height %
+    PR.DisplaySwitch(3); // SliderNumber,[PictureNumber].
+
+    PR.DisplaySwitch(4,2,65,60,8,16); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(82,50,16,8); // Center X %, Center Y %, Width % Height %
+    PR.DisplaySwitch(5); // SliderNumber,[PictureNumber].
+
+    PR.DisplaySwitch(6,1,100,10,16,8); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(120,30,16,8); // Center X %, Center Y %, Width % Height %
+    PR.DisplaySwitch(7); // SliderNumber,[PictureNumber].
+
+    PR.DisplaySwitch(8,2,135,60,16,8); // SliderNumber,[PictureNumber].
+  );
+
+  (mode==3) ? ( //Knobs and meters
+    PR.SetShape(15,20,15); // Center X %, Center Y %, Width % Height %
+    PR.DisplayKnob(mySlider1); // SliderNumber,[PictureNumber].
+
+    PR.DisplayKnob(mySlider2,40,20,18); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(65,20,12); // Center X %, Center Y %, Width % Height %
+    PR.DisplayKnob(mySlider3,1); // SliderNumber,[PictureNumber].
+
+    PR.DisplayKnob(mySlider4,1,90,20,22); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(15,50,15); // Center X %, Center Y %, Width % Height %
+    PR.DisplayKnob(mySlider5); // SliderNumber,[PictureNumber].
+
+    PR.DisplayKnob(mySlider6,40,50,20); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(65,50,12); // Center X %, Center Y %, Width % Height %
+    PR.DisplayKnob(mySlider7,1); // SliderNumber,[PictureNumber].
+
+    PR.DisplayKnob(mySlider8,1,90,50,25); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(30,80,23); // Center X %, Center Y %, Width % Height %
+    PR.DisplayMeter(slider1,1,11); // Value Min Max
+
+    PR.DisplayMeter(slider2,1,11,80,80,20); // Value Min Max
+ );
+
+  (mode==4) ? ( //Rotary Switches
+    PR.SetShape(15,20,15); // Center X %, Center Y %, Width % Height %
+    PR.DisplayRotarySwitch(1,4); // SliderNumber,[PictureNumber].
+
+    PR.SetShape(40,20,20); // Center X %, Center Y %, Width % Height %
+    PR.DisplayRotarySwitch(2,3,1); // SliderNumber,[PictureNumber].
+
+    PR.DisplayRotarySwitch(3,5,15,50,25); // SliderNumber,[PictureNumber].
+    PR.DisplayRotarySwitch(4,6,1,40,50,15); // SliderNumber,[PictureNumber].
+  );
+
+
+  (PR.Debug!="") ? PR.DisplayText(50,50,10,PR.Debug); // Used for debuging!

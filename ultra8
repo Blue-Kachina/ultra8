@@ -1,7 +1,8 @@
-desc:Super8 MIDI-controlled synchronized looper (Cockos)
+desc:Ultra8 Looper
 
 // Copyright (C) 2015 and onward Cockos Inc
 // LICENSE: LGPL v2 or later - http://www.gnu.org/licenses/lgpl.html
+// Fork From: Super8 MIDI-controlled synchronized looper (Cockos)
 
 // General notes:
 // 8 channels of audio input (1 channel per channel)
@@ -51,6 +52,18 @@ desc:Super8 MIDI-controlled synchronized looper (Cockos)
 //   (useful for hand-shortages)
 // - latch: wait to run commands until next loop iteration
 
+provides:
+  philranger_GUI and Audio Library/PhilRangerAudioLibraryAlpha5.jsfx-inc
+  philranger_GUI and Audio Library/Knob.png
+  philranger_GUI and Audio Library/Highlight.png
+  philranger_GUI and Audio Library/Switch.png
+
+import PhilRangerAudioLibraryAlpha5.jsfx-inc
+
+filename:0,philranger_GUI and Audio Library/Highlight.png
+filename:1,philranger_GUI and Audio Library/Knob.png
+filename:2,philranger_GUI and Audio Library/Switch.png
+
 <? nch < 1 ? nch = 8 ?>
 <? maxmem < 8 ? maxmem = 256 ?>
 <?
@@ -74,7 +87,7 @@ slider4:g_slider_click_cnt=0<0,64,1>-Click count/length
 g_nchan = <? printf("%d",nch) ?>;
 g_max_alloc = __memtop(); // JSFX memory available
 g_latchq_len = 1024; // 1024 midi events queueable for latch mode
-g_maxlen = ((g_max_alloc - 4096 - g_latchq_len*3)/g_nchan)|0; // use nearly all of available memory
+g_maxlen = ((g_max_alloc - 4096 - g_latchq_len*3)/(g_nchan*2))|0; // half per active buffer, half reserved for undo snapshots
 g_infthreshdb = -120;
 g_infthresh = 10^(g_infthreshdb/20);
 g_latchmode=0;
@@ -96,8 +109,10 @@ st_peak_in = 10;
 st_rdc = 11; // msec, chX.rdc is samples
 st_div = 12; // subdiv, 1=normal, chX.div is 1/this
 st_fade_size = 13; // fadeout size
-st_midichan = 14; // per-lane MIDI channel for common-mode routing (1–16)
-st_num = 15;
+st_midichan  = 14; // per-lane MIDI channel for common-mode routing (1–16)
+st_undo_buf  = 15; // pointer to pre-allocated undo snapshot buffer
+st_undo_len  = 16; // samples stored in snapshot (0 = no snapshot available)
+st_num = 17;
 
 function recalc_fades() (
   g_fadespeed = exp(-1/(srate * 0.002));  // fade speed for monitoring
@@ -147,7 +162,9 @@ function init(x, n1,n2,n3)
   rec[st_div] = 1;
   rec[st_fade_size] = 0;
   rec[st_midichan] = x + 1; // default: lane 0 → ch1, lane 1 → ch2, etc.
-  
+  rec[st_undo_buf] = 0;     // set by post-init alloc loop
+  rec[st_undo_len] = 0;     // no snapshot initially
+
   this.updatefromrec();
 );
 
@@ -496,7 +513,7 @@ ext_noinit == 0 ? (
   g_latchq = alloc(g_latchq_len*3);
   g_latchq_used=0;
   
-  mem_gen_sz=22;
+  mem_gen_sz=24;
   mem_gen_cfg = alloc(mem_gen_sz);
   memset(mem_gen_cfg,128,mem_gen_sz);
 
@@ -517,11 +534,13 @@ ext_noinit == 0 ? (
   cfgp_playall =   mem_gen_cfg + 14;
   cfgp_playsel =   mem_gen_cfg + 15;
   (cfgp_link =     mem_gen_cfg + 16)[]=0;
-  cfgp_common_rec = mem_gen_cfg + 17;
-  cfgp_common_ply = mem_gen_cfg + 18;
-  cfgp_common_sel = mem_gen_cfg + 19;
-  cfgp_common_mon = mem_gen_cfg + 20;
-  mem_gen_cfg[21] = 1; // g_common: common mode on by default
+  cfgp_common_rec  = mem_gen_cfg + 17;
+  cfgp_common_ply  = mem_gen_cfg + 18;
+  cfgp_common_sel  = mem_gen_cfg + 19;
+  cfgp_common_mon  = mem_gen_cfg + 20;
+  cfgp_common_clr  = mem_gen_cfg + 21;
+  cfgp_common_undo = mem_gen_cfg + 22;
+  mem_gen_cfg[23]  = 1; // g_common: common mode on by default
   
   mem_gen_names = alloc(mem_gen_sz);
   memset(mem_gen_names,"",mem_gen_sz);
@@ -564,12 +583,23 @@ ext_noinit == 0 ? (
   g_chan_selected = -1; // currently selected channel
   g_lastmsg = -1;
   
-  <? loop(x=0;a=36; nch, 
+  <? loop(x=0;a=36; nch,
       printf("ch%d.init(%d,%d,%d, 128);\n",x+1,x,a,a+1);
       a+= x==1 ||x==4 || x==6? 3 : 2;
       x+=1;
      )
    ?>
+
+  // Pre-allocate per-lane undo buffers (same capacity as active buffers)
+  i = mem_stlist;
+  loop(g_nchan,
+    i[st_undo_buf] = alloc(g_maxlen);
+    i += st_num;
+  );
+
+  // Register JSFX sliders with the PR library (required before any PR display calls)
+  pr_sync     = PR.NewSlider(1, 0, 0, 2);   // slider1: sync mode (0=off, 1=project, 2=playback)
+  pr_clickcnt = PR.NewSlider(4, 0, 0, 64);  // slider4: click count / loop length
 );
 
 @slider
@@ -641,7 +671,7 @@ function doconf() local(i,s) (
     g_slider_sync = cfgp_sync[];
     g_latchmode = cfgp_latch[];
     g_slider_click_cnt = cfgp_clickcnt[]|0;
-    g_common = mem_gen_cfg[21]; // restore common mode toggle from saved state
+    g_common = mem_gen_cfg[23]; // restore common mode toggle from saved state
     last_w=0;
   );
 );
@@ -787,8 +817,9 @@ while (sidx == nextmsg_offs)
   // Extract MIDI channel BEFORE CC/PC remap (which overwrites the status byte)
   g_msg_chan = (nextmsg_1 & 0x0F) + 1;
 
-  // Remap CC/PC to note-on, preserving channel nibble
-  (nextmsg_1 & 0xF0) == 0xB0 ? ( nextmsg_1 = 0x90 | (nextmsg_1 & 0x0F); nextmsg_2 += 129; ) :
+  // Remap CC/PC to note-on, preserving channel nibble.
+  // Gate CC on value >= 1: discard value=0 release messages from button controllers.
+  (nextmsg_1 & 0xF0) == 0xB0 && nextmsg_3 >= 1 ? ( nextmsg_1 = 0x90 | (nextmsg_1 & 0x0F); nextmsg_2 += 129; ) :
   (nextmsg_1 & 0xF0) == 0xC0 ? ( nextmsg_1 = 0x90 | (nextmsg_1 & 0x0F); nextmsg_2 += 129*2; nextmsg_3=127; );
 
   // Common mode: resolve global assignments to per-lane inject form BEFORE latch check,
@@ -798,8 +829,35 @@ while (sidx == nextmsg_offs)
     loop(g_nchan,
       mem_stlist[g_cmn_i*st_num + st_midichan] == g_msg_chan ? (
         g_cmn_rec = mem_stlist + g_cmn_i*st_num;
-        nextmsg_2 == cfgp_common_rec[] ? nextmsg_2 = 1024 + g_cmn_rec + st_note1 :
+        nextmsg_2 == cfgp_common_rec[] ? (
+          // Snapshot before overdub: save buffer state when lane is playing with content
+          g_cmn_rec[st_state] == 1 && g_cmn_rec[st_dirty] > 0 && g_cmn_rec[st_dirty] <= g_maxlen ? (
+            memcpy(g_cmn_rec[st_undo_buf], g_cmn_rec[st_buf], g_cmn_rec[st_dirty]);
+            g_cmn_rec[st_undo_len] = g_cmn_rec[st_dirty];
+          );
+          nextmsg_2 = 1024 + g_cmn_rec + st_note1;
+        ) :
+        nextmsg_2 == cfgp_common_clr[] ? (
+          // Clear lane: stop playback, zero buffer, invalidate undo snapshot
+          g_cmn_clr = g_cmn_i;
+          <? loop(x=0;nch, printf("g_cmn_clr == %d ? (ch%d.setstate(0); ch%d.rev_stop(); ch%d.dirty_top=-1;) :\n",x,x+1,x+1,x+1); x+=1;) ?> 0;
+          g_cmn_rec[st_dirty] > 0 ? memset(g_cmn_rec[st_buf], 0, g_cmn_rec[st_dirty]);
+          g_cmn_rec[st_dirty] = 0;
+          g_cmn_rec[st_undo_len] = 0;
+          nextmsg_3 = 0; // suppress further dispatch
+        ) :
         nextmsg_2 == cfgp_common_ply[] ? nextmsg_2 = 1024 + g_cmn_rec + st_note2 :
+        nextmsg_2 == cfgp_common_undo[] ? (
+          // Undo: restore pre-overdub snapshot if available
+          g_cmn_rec[st_undo_len] > 0 ? (
+            memcpy(g_cmn_rec[st_buf], g_cmn_rec[st_undo_buf], g_cmn_rec[st_undo_len]);
+            g_cmn_rec[st_dirty] = g_cmn_rec[st_undo_len];
+            g_cmn_drt = g_cmn_i;
+            <? loop(x=0;nch, printf("g_cmn_drt == %d ? ch%d.dirty_top = g_cmn_rec[st_undo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
+            updatechfromrec();
+          );
+          nextmsg_3 = 0; // suppress further dispatch
+        ) :
         nextmsg_2 == cfgp_common_sel[] ? nextmsg_2 = 1024 + g_cmn_rec + st_note3 :
         nextmsg_2 == cfgp_common_mon[] ? (
           // Mon: cycle immediately (not latched); suppress normal dispatch
@@ -870,7 +928,7 @@ g_prevent_processing===0 ? (
 
 <? printf("spl%d",nch) ?> = g_chan_selected >= 0 ? spl(g_chan_selected);
 
-@gfx 420 480
+@gfx 900 760
 
 get_section('gfx');
 
@@ -921,7 +979,7 @@ function draw_speaker(xpos, ypos, w)
 function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
   local(t w tw th do_overlay cap_cnt rec2)
 (          
-  w = 24;
+  w = 45;
   xpos < 0 ? xpos = (-xpos)-w;
   cap_mode == midimem ? (
     t = (mouse_y-cap_last_y)/4;
@@ -937,7 +995,7 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
         updatechfromrec();
         draw=1;
       );
-    ) : lbl == "div" ? (
+    ) : lbl == "DIV" ? (
       (tw=(t|0)) ? (
         cap_last_y = mouse_y - (t - tw)*4;
         t = min(max(midimem[0] - tw,1),64);
@@ -948,7 +1006,7 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
           lastchanlink |= (1<<40); // trigger redraw
         );
       );
-    ) : lbl == "ch" ? (
+    ) : lbl == "CH" ? (
       // Channel tweaker: integer 1–16, no MIDI type cycling
       (tw=(t|0)) ? (
         cap_last_y = mouse_y - (t - tw)*4;
@@ -959,7 +1017,7 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
         );
       );
       !(mouse_cap&2) && !cap_cnt ? draw=1;
-    ) : lbl == "fad" ? (
+    ) : lbl == "FAD" ? (
       (tw=-(t|0)) ? (
         cap_last_y = mouse_y - (t + tw)*4;
         t = max(midimem[0],0);
@@ -998,7 +1056,7 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
       );
     );
   );
-  cap_mode == 0 &&  mouse_in(xpos,ypos,w,24) ? (
+  cap_mode == 0 &&  mouse_in(xpos,ypos,w,42) ? (
     (mouse_cap & 1) && !(last_mouse_cap&1) ? (  
       midimem >= mem_stlist && midimem < mem_stlist+st_num*g_nchan ? (
         t = (midimem-mem_stlist)%st_num;
@@ -1027,15 +1085,16 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
   draw ? (
     t=midimem[0];
     gfx_set(.35);
-    gfx_rect(xpos,ypos,w,24);
+    gfx_setfont(1,"Arial",13);
+    gfx_rect(xpos,ypos,w,42);
     lbl == "RDC" ? (
       do_overlay=0;
       t=floor(t*10)*.1;
       t = t<0.1 ? "0mS" : sprintf(#str, t<10?"%.1f":"%d",t);
-    ) : lbl == "ch" ? (
+    ) : lbl == "CH" ? (
       do_overlay=0;
       t=sprintf(#str, "%d", midimem[0]|0);
-    ) : lbl == "fad" ? (
+    ) : lbl == "FAD" ? (
       t >= 1 ? (
         t=sprintf(#,"%d",t);
       ) : t > 0 ? (
@@ -1045,7 +1104,7 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
       (do_overlay=format_note(#str,t)) ? (
         do_overlay = do_overlay==1?"CC":"PC";
         gfx_measurestr(do_overlay,tw,th);
-        gfx_y=ypos + (lbl?(22-th):(24-th)*.5)- 4;
+        gfx_y=ypos + (lbl?(40-th):(42-th)*.5)- 4;
         gfx_x=xpos + max(0,(w-tw)*.5 - 3);
         do_overlay=="CC" ? gfx_set(0.9,.5,.2) : gfx_set(0.5,.5,.9);
         gfx_drawstr(do_overlay);
@@ -1054,7 +1113,7 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
       t=#str;
     );
     gfx_measurestr(t,tw,th);
-    gfx_y=ypos + min((lbl?(22-th):(24-th)*.5) + do_overlay, 24-th);
+    gfx_y=ypos + min((lbl?(40-th):(42-th)*.5) + do_overlay, 42-th);
     gfx_x=xpos + min((w-tw)*.5 + do_overlay, w-tw);
     gfx_set(0.1);
     gfx_drawstr(t);
@@ -1065,6 +1124,7 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
       gfx_y=ypos+2;
       gfx_drawstr(lbl);
     );
+    gfx_setfont(0);
   );
   w;
 );
@@ -1192,9 +1252,17 @@ function load_file(filename, channel) local(fh nch sr len rec rec2 buf buf2 v i)
   );
 );
 
-function draw(ixpos, ypos) local(i i2 w h gap rec mode force_redraw rowsize
-  mx my mw t nrows lx ly wantr ty tw th rec2 wl
-  now lasthalve lastlen lastoffs col xpos dropfile lastcommon tx)
+function draw(ixpos, ypos) local(i gap rec mode force_redraw
+  mx my mw t lx ty tw th rec2 wl
+  now dropfile lastcommon tx
+  lane_h avail_lanes action_y action_h
+  pr_s state_w peak_w wave_w sub_w mon_w
+  state_x peak_x wave_x sub_x mon_x midi_x
+  row_y row_cy wantr w
+  g_curpk g_curpk_h
+  lasthalve lastlen lastoffs lastchanlink
+  tweaker_w tweaker_h link_area_w extra_gap content_right r_pos
+  mon_sz fad_x div_x rdc_x ch_x t_ypos)
 (
   force_redraw = gfx_w != last_w || gfx_h != last_h ||
     lasthalve != cfgp_fade[] || lastlen != g_length ||
@@ -1207,17 +1275,9 @@ function draw(ixpos, ypos) local(i i2 w h gap rec mode force_redraw rowsize
   lastcommon = g_common;
 
   gap = 4;
-  xpos = (ixpos += 2);
-  col = 16*(gfx_h-ypos-8) / ((gfx_w - ixpos)*(g_nchan+8));
-  rowsize = col <= .115 ? 16 : col <= .5 ? 8 : col <= 2 ? 4 : col <= 8 ? 2 : 1;
-  w=(gfx_w - 2 - gap*(rowsize-1))/rowsize;
-  (nrows = (8+g_nchan)/rowsize) != 2 ? w=min(w, ((gfx_h - ypos - 8 - gap*(nrows-1))/nrows));
-
-  h=(w|=0);
-  mw = (w*.2)|0;
-  col=i=0;
-  rec = mem_stlist;
-  now=time_precise();
+  now = time_precise();
+  pr_s = min(gfx_w, gfx_h);
+  pr_s < 1 ? pr_s = 1;
 
   gfx_getdropfile(0, dropfile=#) ? (
     gfx_getdropfile(-1);
@@ -1226,207 +1286,318 @@ function draw(ixpos, ypos) local(i i2 w h gap rec mode force_redraw rowsize
     dropfile = 0;
   );
 
-  // Common mode global strip: four MIDI-assignable tweakers for rec/ply/sel/mon
+  // Common mode global strip
   g_common ? (
     force_redraw ? (
-      gfx_set(0.12,0.08,0.22);
-      gfx_rect(ixpos-2,ypos,gfx_w-ixpos+2,36);
-      gfx_set(0.35,0.25,0.55);
-      gfx_rect(ixpos-2,ypos,gfx_w-ixpos+2,1); // top border
-      gfx_rect(ixpos-2,ypos+35,gfx_w-ixpos+2,1); // bottom border
+      // Overall strip background
+      PR.Color.Panel = "201A40FF";
+      PR.Color.Contour = "403060FF";
+      PR.DisplayPanel(
+        (ixpos + (gfx_w - ixpos) * 0.5) / pr_s * 100,
+        (ypos + 27) / pr_s * 100,
+        (gfx_w - ixpos) / pr_s * 100,
+        54 / pr_s * 100
+      );
     );
+
     tx = ixpos + gap;
-    tx += draw_value_tweaker(tx,ypos+6,cfgp_common_rec,force_redraw,"rec") + gap;
-    tx += draw_value_tweaker(tx,ypos+6,cfgp_common_ply,force_redraw,"ply") + gap;
-    tx += draw_value_tweaker(tx,ypos+6,cfgp_common_sel,force_redraw,"sel") + gap;
-    tx += draw_value_tweaker(tx,ypos+6,cfgp_common_mon,force_redraw,"mon") + gap;
-    ypos += 40; // push lane rows below the strip
+
+    // rec — standard purple
+    force_redraw ? (
+      PR.Color.Panel = "2A1F50FF"; PR.Color.Contour = "5050A0FF";
+      PR.DisplayPanel((tx + 23) / pr_s * 100, (ypos + 27) / pr_s * 100, 47 / pr_s * 100, 46 / pr_s * 100);
+    );
+    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_rec, force_redraw, "REC") + gap;
+
+    // clr — warm amber-brown (destructive action)
+    force_redraw ? (
+      PR.Color.Panel = "3D2010FF"; PR.Color.Contour = "B05020FF";
+      PR.DisplayPanel((tx + 23) / pr_s * 100, (ypos + 27) / pr_s * 100, 47 / pr_s * 100, 46 / pr_s * 100);
+    );
+    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_clr, force_redraw, "CLR") + gap;
+    tx += 8;
+
+    // ply — standard purple
+    force_redraw ? (
+      PR.Color.Panel = "2A1F50FF"; PR.Color.Contour = "5050A0FF";
+      PR.DisplayPanel((tx + 23) / pr_s * 100, (ypos + 27) / pr_s * 100, 47 / pr_s * 100, 46 / pr_s * 100);
+    );
+    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_ply, force_redraw, "PLY") + gap;
+
+    // undo — green tint (restorative action)
+    force_redraw ? (
+      PR.Color.Panel = "1A3020FF"; PR.Color.Contour = "30A040FF";
+      PR.DisplayPanel((tx + 23) / pr_s * 100, (ypos + 27) / pr_s * 100, 47 / pr_s * 100, 46 / pr_s * 100);
+    );
+    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_undo, force_redraw, "UNDO") + gap;
+    tx += 8;
+
+    // sel — standard purple
+    force_redraw ? (
+      PR.Color.Panel = "2A1F50FF"; PR.Color.Contour = "5050A0FF";
+      PR.DisplayPanel((tx + 23) / pr_s * 100, (ypos + 27) / pr_s * 100, 47 / pr_s * 100, 46 / pr_s * 100);
+    );
+    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_sel, force_redraw, "SEL") + gap;
+
+    // mon — standard purple
+    force_redraw ? (
+      PR.Color.Panel = "2A1F50FF"; PR.Color.Contour = "5050A0FF";
+      PR.DisplayPanel((tx + 23) / pr_s * 100, (ypos + 27) / pr_s * 100, 47 / pr_s * 100, 46 / pr_s * 100);
+    );
+    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_mon, force_redraw, "MON") + gap;
+    ypos += 56;
   );
 
-  loop(g_nchan,
-    mx = xpos + w - mw - gap;
-    my = ypos+gap;
+  // Horizontal row-per-lane layout
+  action_h = 72;
+  action_y = gfx_h - action_h - 21;  // 21px empty space below action strip
+  avail_lanes = action_y - ypos;
+  lane_h = max((avail_lanes / g_nchan)|0, 20);
 
-    dropfile && mouse_in(xpos,ypos,w,h) ? load_file(dropfile, i);
+  // Column widths and right-side layout
+  tweaker_w    = 45;
+  tweaker_h    = 42;
+  link_area_w  = 25;   // 21px link button + 2px gap each side
+  extra_gap    = 10;
+
+  state_w = max((gfx_w * 0.06)|0, 46);
+  peak_w  = 7;
+  state_x = ixpos;
+  content_right = gfx_w - link_area_w;
+
+  // Speaker size: fill lane height (capped at 36)
+  mon_sz = max(min(lane_h - 6, 36), 16);
+
+  // Build right-side positions from right edge inward
+  // extra_gap on both sides of speaker (mirrors gap to left of speaker)
+  r_pos = content_right - extra_gap;
+  mon_x = r_pos - mon_sz;
+  r_pos = mon_x - extra_gap;
+
+  gfx_w > 750 ? ( fad_x = r_pos - tweaker_w; r_pos = fad_x - gap; ) : fad_x = -1;
+  gfx_w > 600 ? ( div_x = r_pos - tweaker_w; r_pos = div_x - gap; ) : div_x = -1;
+  rdc_x = r_pos - tweaker_w;
+  r_pos = rdc_x - extra_gap;
+  g_common ? ( ch_x = r_pos - tweaker_w; r_pos = ch_x - gap; ) : ch_x = -1;
+
+  wave_x = state_x + state_w;
+  wave_w = max(r_pos - wave_x - gap, 30);
+
+  rec = mem_stlist;
+  i = 0;
+  loop(g_nchan,
+    row_y  = ypos + i * lane_h;
+    row_cy = row_y + (lane_h/2)|0;
+
+    dropfile && mouse_in(state_x, row_y, gfx_w - 16, lane_h) ? load_file(dropfile, i);
 
     !cap_mode && (mouse_cap&1) && !(last_mouse_cap&1) ? (
-      w > 80 &&
-        (!(i&1) ? mouse_in(xpos+w-10, my+mw+1, 10+gap-1, 10) :
-          mouse_in(xpos, my+mw+1, 12, 10)) ? (
+      // Link button hit zone: right 22px, spanning both lanes of a pair
+      (i&1) && mouse_in(gfx_w - 25, row_y - lane_h, 25, lane_h*2) ? (
         cfgp_link[] ~= 1<<(i>>1);
-      ) : mouse_in(xpos, ypos, w, h) ? (
-        g_chan_selected=i;
+      ) : mouse_in(state_x, row_y, gfx_w - 22, lane_h) ? (
+        g_chan_selected = i;
       );
     );
 
     mode = rec[st_state];
-    mode ? (
-      gfx_set(mode==2 ? 1 : 0.25,mode==1?1:0.25, 0.25);
-    ) : (
-      rec[st_dirty] ? gfx_set(0.3,0.3,0.4) : gfx_set(0.25);
-    );
-    is_chan_selected(i) ? mode|=8;
-    rec[st_dirty] ? mode|=16;
+    is_chan_selected(i) ? mode |= 8;
+    rec[st_dirty] ? mode |= 16;
     mode |= rec[st_monmode] << 8;
     g_firstrec ? mode |= 1<<30;
-  
-    force_redraw || rec[st_lastd] != mode || ((mode&2) && now>rec[st_lastpkupd]+0.5) ? (
+
+    force_redraw || rec[st_lastd] != mode || now > rec[st_lastpkupd] + 0.05 ? (
       rec[st_lastd] = mode;
-      rec[st_lastpkupd]=now;
-      draw_button(xpos,ypos,w,h, mode&8 ? 2 : 0);
+      rec[st_lastpkupd] = now;
+      wantr = 1;
 
-      gfx_set(1,1,1);
-      gfx_x = xpos + 8;
-      gfx_y = ypos + 8;
-      gfx_printf("%d",i+1);    
+      // Lane container panel (full width minus link area, colored by state)
+      rec[st_state] == 2 ? PR.Color.Panel = "3A1A1AFF" :
+      rec[st_state] == 1 ? PR.Color.Panel = "1A3A1AFF" :
+      rec[st_dirty]      ? PR.Color.Panel = "2A2A40FF" :
+                           PR.Color.Panel = "252530FF";
+      PR.Color.Contour = "5060A0FF";
+      (mode&8) ? PR.Color.Contour = "8090E0FF";
+      PR.DisplayPanel(
+        (state_x + (content_right - state_x) * 0.5) / pr_s * 100,
+        (row_y + lane_h * 0.5) / pr_s * 100,
+        (content_right - state_x) / pr_s * 100,
+        lane_h / pr_s * 100
+      );
 
+      // State area fill: explicit raw rect painted after the PR panel so any
+      // floating-point rounding in PR.DisplayPanel can't leave a gap at wave_x.
+      // Covers from inside the left contour border (x+2) to exactly wave_x.
+      rec[st_state] == 2 ? gfx_set(0x3A/255.0, 0x1A/255.0, 0x1A/255.0) :
+      rec[st_state] == 1 ? gfx_set(0x1A/255.0, 0x3A/255.0, 0x1A/255.0) :
+      rec[st_dirty]      ? gfx_set(0x2A/255.0, 0x2A/255.0, 0x40/255.0) :
+                           gfx_set(0x25/255.0, 0x25/255.0, 0x30/255.0);
+      gfx_rect(state_x + 2, row_y + 2, state_w - 2, lane_h - 4);
+
+      // Lane number (left portion of container)
+      PR.Color.Text = "FFFFFFFF";
+      PR.DisplayText(
+        (state_x + state_w*0.5) / pr_s * 100,
+        (row_y + lane_h*0.5) / pr_s * 100,
+        3.5,
+        sprintf(#, "%d", i+1)
+      );
+
+      // Waveform sub-panel — inset 2 px top/bottom so the PR contour border
+      // remains visible between lanes (matching the ~4 px border on the right side).
+      gfx_set(0x14/255.0, 0x14/255.0, 0x20/255.0);
+      gfx_rect(wave_x, row_y + 2, wave_w, lane_h - 4);
+      // thin left separator between lane number area and waveform
+      gfx_set(0x30/255.0, 0x30/255.0, 0x50/255.0);
+      gfx_rect(wave_x, row_y + 2, 1, lane_h - 4);
+
+      // Input peak meter — draw within the inset inner area
+      g_curpk = max(min(log10(rec[st_peak_in] + 0.000001) * 20, 0), -68);
+      g_curpk_h = ((g_curpk + 68) / 68 * (lane_h - 4))|0;
+      gfx_set(0);
+      gfx_rect(wave_x + 2, row_y + 2, peak_w, (lane_h - 4) - g_curpk_h);
+      gfx_set(0.75, 0.75, 0);
+      gfx_rect(wave_x + 2, row_y + 2 + ((lane_h - 4) - g_curpk_h), peak_w, g_curpk_h);
+
+      // Waveform content
       gfx_set(0.5);
-      w > 80 && rec[st_dirty] && (wl = floor(g_length/rec[st_div] + 0.5)) > 0 ?
-        draw_waveform(xpos+gap,ypos+h*.5,floor(w/rec[st_div]+.5)-2*gap,h*.25, rec[st_buf], (g_offs % wl),wl, i);
+      rec[st_dirty] && (wl = floor(g_length / rec[st_div] + 0.5)) > 0 ?
+        draw_waveform(wave_x + peak_w + gap, row_cy, wave_w - peak_w - gap*2, (lane_h-4)*0.4,
+                      rec[st_buf], (g_offs % wl), wl, i);
 
-      rec[st_monmode]==0 ? (
-        gfx_set(0.2)
-      ) : rec[st_monmode]==1 ? (
-        (mode&8) ? gfx_set(0.3,0.3,1.0) : gfx_set(0.3,0.3,0.7)
-      ) : (
-        gfx_set(0.9,0.8,0);
-      );
+      // Monitor icon (speaker, 3-state) — right-aligned
+      mx = mon_x;
+      my = row_cy - (mon_sz/2)|0;
 
-      gfx_rect(mx,my,mw,mw);
-      
+      rec[st_monmode] == 0 ? gfx_set(0.2) :
+      rec[st_monmode] == 1 ? ((mode&8) ? gfx_set(0.3,0.3,1.0) : gfx_set(0.3,0.3,0.7)) :
+                              gfx_set(0.9,0.8,0);
+      gfx_rect(mx, my, mon_sz, mon_sz);
+
+      rec[st_monmode] == 0 ? gfx_set(0) :
+      (rec[st_monmode] == 2 || (mode&8)) ? gfx_set(1,1,1,1) : gfx_set(1,1,1,.25);
+      draw_speaker(mx + mon_sz/2, my + mon_sz/2, mon_sz/2);
+
       rec[st_monmode] == 0 ? (
         gfx_set(0);
-      ) : (
-        rec[st_monmode]==2 || (mode&8) ? (
-          gfx_set(1,1,1, 1);
-        ) : (
-          gfx_set(1,1,1, .25);
-        );
+        gfx_line(mx, my, mx+mon_sz, my+mon_sz);
+        gfx_line(mx+mon_sz, my, mx, my+mon_sz);
       );
-      draw_speaker(mx+mw/2,my+mw/2,mw/2);    
-        
-      rec[st_monmode] == 0 ? (
-        gfx_set(0);
-        gfx_line(mx,my,mx+mw,my+mw);
-        gfx_line(mx+mw,my,mx,my+mw);
-      );      
-         
-      wantr=1;
+
     ) : (
-      wantr=0;
+      wantr = 0;
     );
-    t = mem_stlist + i*st_num;
-    lx = xpos + w - gap;
-    ly = ypos+h-24-gap;
+
+    // Sub-controls (right-aligned: CH | RDC DIV FAD | speaker)
+    t = mem_stlist + i * st_num;
+    t_ypos = row_cy - (tweaker_h / 2)|0;
+    draw_value_tweaker(rdc_x, t_ypos, t + st_rdc, wantr, "RDC");
+    div_x >= 0 ? draw_value_tweaker(div_x, t_ypos, t + st_div, wantr, "DIV");
+    fad_x >= 0 ? draw_value_tweaker(fad_x, t_ypos, t + st_fade_size, wantr, "FAD");
+
+    // MIDI input tweakers (CH or per-note, right-aligned)
     g_common ? (
-      // Common mode: show per-lane MIDI channel selector
-      lx -= draw_value_tweaker(-lx,ly,t + st_midichan,wantr, "ch") + gap;
+      ch_x >= 0 ? draw_value_tweaker(ch_x, t_ypos, t + st_midichan, wantr, "CH");
     ) : (
-      // Normal mode: show per-lane rec/ply/sel note assignments
-      w > 80 ? ( lx -= draw_value_tweaker(-lx,ly,t + st_note3,wantr, "sel") + gap; );
-      lx -= draw_value_tweaker(-lx,ly,t + st_note2,wantr, rec[st_state] == 1 ? "stp" : "ply") + gap;
-      lx -= draw_value_tweaker(-lx,ly,t + st_note1,wantr, rec[st_state] == 2 && !g_firstrec ? "ply" : "rec") + gap;
-    );
-    
-    lx = -mx+gap;
-    lx += draw_value_tweaker(lx,my,t + st_rdc, wantr, "RDC") + gap;
-    w > 90 ? lx += draw_value_tweaker(lx,my,t + st_div, wantr, "div") + gap;
-    w > 120 ? lx += draw_value_tweaker(lx,my,t + st_fade_size, wantr, "fad") + gap;
-
-    w > 120 ? (
-      lx = xpos+gap;
-      lx -= draw_value_tweaker(xpos+gap,ly,t + st_note4,wantr, "rev") + gap;    
+      lx = ch_x >= 0 ? ch_x : rdc_x - (tweaker_w + gap) * 4;
+      lx += draw_value_tweaker(lx, t_ypos, t + st_note1, wantr,
+              rec[st_state]==2 && !g_firstrec ? "PLY" : "REC") + gap;
+      lx += draw_value_tweaker(lx, t_ypos, t + st_note2, wantr,
+              rec[st_state]==1 ? "STP" : "PLY") + gap;
+      lx += draw_value_tweaker(lx, t_ypos, t + st_note3, wantr, "SEL") + gap;
+      draw_value_tweaker(lx, t_ypos, t + st_note4, wantr, "REV");
     );
 
-    (mouse_cap&2) && !(last_mouse_cap&2) && !cap_mode && mouse_in(mx,my,mw,mw) ? (
+    // Monitor right-click: cycle 3 modes
+    (mouse_cap&2) && !(last_mouse_cap&2) && !cap_mode &&
+        mouse_in(mon_x, row_y, mon_sz + gap, lane_h) ? (
       rec[st_monmode] = (rec[st_monmode]+1)%3;
       rec2 = get_linked_rec(i);
       rec2 >= 0 ? rec2[st_monmode] = rec[st_monmode];
       updatechfromrec();
       sliderchange(-1);
     );
-    
-    g_curpk = (max(min(log10(rec[st_peak_in]) * 20,0),-68) * w * (1/68) + w);
-    g_curpk = g_curpk > (10^-5) && g_curpk<3 ? 3 : (g_curpk|0);
-    
-    gfx_set(0);
-    gfx_rect(xpos-2,ypos,2,w-g_curpk);
-    gfx_set(.75,.75,0);
-    gfx_rect(xpos-2,ypos+w-g_curpk,2,g_curpk);
-    
-    (i&1) && w > 80 ? (
-      gfx_set(0.35);
-      ty=my+mw+gap;
-      gfx_rect(xpos-16,ty,12,8);
-      gfx_rect(xpos,ty,12,8);
-      get_linked_rec(i) >= 0 ? (
-        gfx_set(0.75);
-        gfx_rect(xpos-14,ty,24,2);
-        gfx_rect(xpos-16,ty,2,8);
-        gfx_rect(xpos+10,ty,2,8);
-        gfx_rect(xpos-14,ty+6,24,2);
+
+    // Link button on right edge, spanning both lanes of a pair
+    (i&1) && force_redraw ? (
+      ty = row_y - lane_h;
+      t = get_linked_rec(i) >= 0;
+      t ? (
+        gfx_set(0.15, 0.35, 0.65);
+        gfx_rect(gfx_w-23, ty+2, 21, lane_h*2-4);
+        gfx_set(0.85, 0.92, 1.0);
       ) : (
-        gfx_set(0.0);
-        gfx_rect(xpos-4,ty,2,8);
+        gfx_set(0.14, 0.14, 0.22);
+        gfx_rect(gfx_w-23, ty+2, 21, lane_h*2-4);
+        gfx_set(0.38, 0.38, 0.52);
       );
+      gfx_setfont(1,"Arial",9);
+      gfx_measurestr("lnk",tw,th);
+      gfx_x = gfx_w-23 + (21-tw)*0.5;
+      gfx_y = ty + lane_h - th*0.5;
+      gfx_drawstr("lnk");
+      gfx_setfont(0);
     );
 
-    i+=1;
+    i += 1;
     rec += st_num;
-    xpos += w + gap;
-    (col+=1)>=rowsize ? (
-      xpos = ixpos;
-      ypos += h + gap;
-      col=0;
-    );
   );
 
-
-  t=0;
-  ypos < gfx_h - 24 ? while ((i=mem_gen_order[t])>=0)
-  (
-    force_redraw ? (
-      i == 1  ? gfx_set(0.0, 0.5, 0.6) :
-      i == 2  ? gfx_set(0.0, 0.6, 0.5) :
-      i == 3  ? gfx_set(0.0, 0.6, 0.4) :
-      i == 7  ? gfx_set(0.7, 0.6, 0.7) :
-      i == 11 ? gfx_set(0.0, 0.5, 0.5) :
-      i == 14 ? gfx_set(0.0, 0.7, 0.0) :
-      i == 15 ? gfx_set(0.9, 0.7, 0.0) :
-                gfx_set(0.5, 0.0, 0.0);
-
-      draw_button(xpos,ypos,w,h,0);
-      gfx_set(1);
-      gfx_measurestr(mem_gen_names[i],tw,th);
-      gfx_x=xpos+(w-tw)*.5;
-      gfx_y=min(ypos+(h-th)*.5,gfx_h-24);
-      gfx_drawstr(mem_gen_names[i]);
-
-      i == 11 ? fadesz_button.draw_topbar_button(xpos+4,ypos+4,
-               sprintf(#,"%s%.0f mS",w<98 ? "" : w<160 ? "fade " : "halve fade: ",lasthalve)
-               );
+  // Action button strip at bottom
+  w = ((gfx_w - gap*7) / 8)|0;
+  lx = 0;
+  t = 0;
+  force_redraw ? (
+    // Strip background
+    PR.Color.Panel = "101018FF";
+    PR.Color.Contour = "1A1A28FF";
+    PR.DisplayPanel(
+      gfx_w * 0.5 / pr_s * 100,
+      (action_y + action_h * 0.5) / pr_s * 100,
+      gfx_w / pr_s * 100,
+      action_h / pr_s * 100
     );
-
+  );
+  while ((i = mem_gen_order[t]) >= 0) (
+    force_redraw ? (
+      // Per-button colored panel (PR library replaces draw_button)
+      i == 1  ? (PR.Color.Panel = "005F73FF"; PR.Color.Contour = "208099FF") :
+      i == 2  ? (PR.Color.Panel = "007360FF"; PR.Color.Contour = "209980FF") :
+      i == 3  ? (PR.Color.Panel = "00734DFF"; PR.Color.Contour = "209966FF") :
+      i == 7  ? (PR.Color.Panel = "5A3A5AFF"; PR.Color.Contour = "806080FF") :
+      i == 11 ? (PR.Color.Panel = "006060FF"; PR.Color.Contour = "208080FF") :
+      i == 14 ? (PR.Color.Panel = "007000FF"; PR.Color.Contour = "20A020FF") :
+      i == 15 ? (PR.Color.Panel = "805F00FF"; PR.Color.Contour = "B08020FF") :
+               (PR.Color.Panel = "600000FF"; PR.Color.Contour = "902020FF");
+      PR.DisplayPanel(
+        (lx + w * 0.5) / pr_s * 100,
+        (action_y + (action_h - 2) * 0.5) / pr_s * 100,
+        (w - 2) / pr_s * 100,
+        (action_h - 4) / pr_s * 100
+      );
+      gfx_set(1);
+      gfx_measurestr(mem_gen_names[i], tw, th);
+      gfx_x = lx + (w - tw) * 0.5;
+      gfx_y = min(action_y + (action_h - th) * 0.5, gfx_h - 28);
+      gfx_drawstr(mem_gen_names[i]);
+      i == 11 ? fadesz_button.draw_topbar_button(lx+4, action_y+4,
+                  sprintf(#, "%s%.0f mS",
+                    w<98 ? "" : w<160 ? "fade " : "halve fade: ", lasthalve));
+    );
     i += mem_gen_cfg;
-    draw_value_tweaker(-(xpos+w-gap), min(ypos+h-24-gap,gfx_h-24),  i, force_redraw, 0);
-
-    !(last_mouse_cap&1) && (mouse_cap&1) && mouse_in(xpos,ypos,w,h) ? (
+    // MIDI assignment button: centered horizontally, half inside strip / half in empty space below
+    draw_value_tweaker(lx + ((w - 45)/2)|0, action_y + action_h - 21, i, force_redraw, 0);
+    !(last_mouse_cap&1) && (mouse_cap&1) && mouse_in(lx, action_y, w, action_h) ? (
       i == cfgp_reset        ? strcat(#mainthread_todo, "r") :
       i == cfgp_halve        ? strcat(#mainthread_todo, "h") :
       i == cfgp_double       ? strcat(#mainthread_todo, "d") :
       i == cfgp_double_norep ? strcat(#mainthread_todo, "D") :
       i == cfgp_export       ? strcat(#mainthread_todo, "e") :
       i == cfgp_xfade        ? strcat(#mainthread_todo, "x") :
-      i == cfgp_playall || i == cfgp_playsel ? g_inject_midinote = 1024 + i; // inject to support latch mode
+      i == cfgp_playall || i == cfgp_playsel ? g_inject_midinote = 1024 + i;
     );
-
-    t+=1;
-    xpos += w + gap;
-    (col+=1)>=rowsize ? (
-      xpos = ixpos;
-      ypos += h + gap;
-      col=0;
-    );
+    t += 1;
+    lx += w + gap;
   );
 );
 
@@ -1435,9 +1606,9 @@ function draw_position(ypos) local(last_pos,last_len)
   last_w != gfx_w || last_h != gfx_h || last_pos != g_pos || last_len != g_length ? (
     last_len = g_length;
     last_pos = g_pos;
-    gfx_set(0.25,0.125,0.0);
+    gfx_set(0.05, 0.05, 0.13);  // dark navy trough (§2.4)
     gfx_rect(0,ypos,gfx_w,20);
-    gfx_set(0.125,0.25,0.5);
+    gfx_set(0.10, 0.22, 0.55);  // blue playhead progress
     g_length > 0 ? gfx_rect(0,ypos,g_pos/g_length * gfx_w,20);
     gfx_x=2;
     gfx_y=ypos+2;
@@ -1461,7 +1632,7 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
   );
 
   need_ref ? (
-    gfx_set(0,0,0.3);
+    gfx_set(0, 0, 0.31);  // 00004FFF deep navy per §2.4
     gfx_rect(0,0,gfx_w,14);
 
     gfx_x=60;
@@ -1507,7 +1678,7 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
         cfgp_latch[] = g_latchmode = !g_latchmode;
       ) : common_button.hit_topbar_button(mouse_x,mouse_y,-1) ? (
         g_common = !g_common;
-        mem_gen_cfg[21] = g_common;
+        mem_gen_cfg[23] = g_common;
         sliderchange(-1); // persist to @serialize
         last_w = 0;       // force full redraw to show/hide common strip
       ) : (
@@ -1554,7 +1725,7 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
   gfx_x=0;
   gfx_y=4;
   t=time_precise();
-  s="Super<?printf("%d",nch)?>";
+  s="Ultra<?printf("%d",nch)?>";
   i=0;
   loop(strlen(s),
     gfx_set(sin(t+i*0.2)*0.3+0.5, cos(t*.61+i*0.5)*.7+0.3, sin(t*2.1-i*0.6)*.3+0.7);
@@ -1645,19 +1816,25 @@ function draw_trim_waveform(xpos, ypos, w, h, chan, isend)
 
 !(gfx_ext_flags&2) ? (
   gfx_clear=-1;
-  
+
+  // Global PR color defaults for this frame (§2.4 theme palette)
+  PR.Color.Contour = "5060A0FF";
+  PR.Color.Text    = "FFFFFFFF";
+  PR.Color.Panel   = "252530FF";
+  PR.Color.Shadow  = "00000080";
+
   vclick_pos = cfgp_vclick[]>0 ? get_vclick_pos(cfgp_vclick[]) : -1;
-  
+
   last_vclick_pos != vclick_pos ? (
     last_w=0;
     last_vclick_pos=vclick_pos;
   );
-  
+
   last_w != gfx_w || last_h != gfx_h ? (
-    gfx_set(0.125);
+    gfx_set(0.05, 0.05, 0.10);  // deep dark navy base (§2.4)
     gfx_rect(0,0,gfx_w,gfx_h);
   );
-  
+
   draw_topbar(last_w != gfx_w || last_h != gfx_h);
   draw_position(15);
   draw(0, 40);

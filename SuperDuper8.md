@@ -35,7 +35,11 @@ Super8 uses a right-click/drag system to assign MIDI notes, CCs, and PCs to cont
 - `link` (`cfgp_link`) — click on the link bracket between paired lanes only
 - Per-lane `RDC`, `div`, `fade` sub-controls — UI drag only
 
-For Phase 1, the critical gap is **monitoring mode**: it is one of the four per-lane controls named in the feature spec but currently cannot be triggered by MIDI at all. This must be addressed.
+**New per-lane actions to be added (do not exist in Super8):**
+- **`clr`** — immediately clears (destroys) the audio content of a single lane, with no UI confirmation
+- **`undo`** — restores the lane's audio buffer to the state it was in immediately before the most recent overdub; single-level per lane (see §1.4 Undo Buffer Management)
+
+For Phase 1, the critical gaps are **monitoring mode**, **per-lane clear**, and **per-lane undo**: none of these can currently be triggered by MIDI. All three must be addressed.
 
 ---
 
@@ -51,13 +55,15 @@ Add a new global boolean state variable `g_common` (default `1` = on). It should
 
 **Hide** per-lane instances of `rec`, `ply`, `sel`, and monitoring state controls from each loop lane row. Free up that real estate — it will be needed for the `channel` input (see below).
 
-**Show globally** (in the top bar or a dedicated global-controls strip below the top bar) four MIDI-assignable input widgets:
+**Show globally** (in the top bar or a dedicated global-controls strip below the top bar) six MIDI-assignable input widgets:
 - `rec` — same semantics as the per-lane `rec` note
+- `clr` — new: immediately clears the target lane's audio buffer (no confirmation)
 - `ply` — same semantics as per-lane `ply`
+- `undo` — new: restores the target lane's audio buffer to its pre-overdub snapshot (single level)
 - `sel` — same semantics as per-lane `sel`
 - `mon` — new: cycles the target lane's monitoring mode (off → auto → always-on → off)
 
-These four global inputs use the same `draw_value_tweaker` widget and right-click assignment mechanism as all existing controls. They read from four new global config pointers: `cfgp_common_rec`, `cfgp_common_ply`, `cfgp_common_sel`, `cfgp_common_mon`.
+These six global inputs use the same `draw_value_tweaker` widget and right-click assignment mechanism as all existing controls. They read from six new global config pointers: `cfgp_common_rec`, `cfgp_common_clr`, `cfgp_common_ply`, `cfgp_common_undo`, `cfgp_common_sel`, `cfgp_common_mon`.
 
 **Show per lane** a `channel` input widget in place of the hidden rec/ply/sel controls. This is an integer value in the range 1–16 representing the MIDI channel that lane listens on. It can be drawn with `draw_value_tweaker` using a new label (`"ch"`). Persist it as a new per-lane field; add `st_midichan` to the state record (increment `st_num` accordingly and update `@serialize`).
 
@@ -86,20 +92,35 @@ msg_chan = (nextmsg_1 & 0x0F) + 1;  // 1-based MIDI channel (1–16)
 
 Replace the current hard-coded status byte checks with comparisons against `msg_type`. The existing CC→note and PC→note remapping logic can remain, but apply it after extracting the channel so `msg_chan` is preserved.
 
+#### CC Value Gating
+
+Before any CC→note remapping or common-mode dispatch, gate on the CC value:
+
+```
+nextmsg_3 >= 1 ? (
+  // proceed with remapping and routing
+);
+```
+
+This suppresses the value=0 release messages that button controllers (e.g. PaintAudio MIDI Captain NANO 4) send on button release, preventing spurious double-triggers. Value=0 messages are discarded silently.
+
 #### Routing in `common` Mode
 
 After the existing CC/PC-to-note remapping, add a `common` mode branch in `chan_onmsg`:
 
 ```
+```
 g_common ? (
   // Find the lane whose st_midichan matches msg_chan
-  // then fire the global rec/ply/sel/mon assignment against that lane
+  // then fire the global rec/clr/ply/undo/sel/mon assignment against that lane
   loop(g_nchan,
     mem_stlist[i*st_num + st_midichan] == msg_chan ? (
-      nextmsg_2 == cfgp_common_rec[] ? /* inject rec note for lane i */ :
-      nextmsg_2 == cfgp_common_ply[] ? /* inject ply note for lane i */ :
-      nextmsg_2 == cfgp_common_sel[] ? /* inject sel note for lane i */ :
-      nextmsg_2 == cfgp_common_mon[] ? /* cycle monmode for lane i */  ;
+      nextmsg_2 == cfgp_common_rec[]  ? /* inject rec note for lane i */  :
+      nextmsg_2 == cfgp_common_clr[]  ? /* clear audio buffer for lane i */ :
+      nextmsg_2 == cfgp_common_ply[]  ? /* inject ply note for lane i */  :
+      nextmsg_2 == cfgp_common_undo[] ? /* restore undo snapshot for lane i */ :
+      nextmsg_2 == cfgp_common_sel[]  ? /* inject sel note for lane i */  :
+      nextmsg_2 == cfgp_common_mon[]  ? /* cycle monmode for lane i */    ;
     );
     i += 1;
   );
@@ -111,7 +132,23 @@ g_common ? (
 );
 ```
 
-The "inject" approach for `rec`/`ply`/`sel` can reuse the existing `g_inject_midinote` mechanism: set `g_inject_midinote = 1024 + mem_stlist + lane*st_num + st_note1` (or `st_note2`, `st_note3`) and let the next sample block dispatch it naturally. The `mon` action can call the cycle logic inline.
+The "inject" approach for `rec`/`ply`/`sel` can reuse the existing `g_inject_midinote` mechanism: set `g_inject_midinote = 1024 + mem_stlist + lane*st_num + st_note1` (or `st_note2`, `st_note3`) and let the next sample block dispatch it naturally. The `mon` action can call the cycle logic inline. `clr` and `undo` are handled inline (see Undo Buffer Management below).
+
+#### Undo Buffer Management
+
+Per-lane undo stores a single pre-overdub snapshot of each lane's audio buffer. The approach is:
+
+**State fields (new per-lane):**
+- `st_undo_buf` — memory address of the start of this lane's undo snapshot (0 = no snapshot available)
+- `st_undo_len` — number of samples stored in the snapshot
+
+**On overdub start** (when a `rec` trigger fires on a lane that already has content): before recording begins, copy the lane's current audio buffer to its undo region and record its length in `st_undo_len`. This establishes the single undo point. Any subsequent overdub on the same lane overwrites the previous snapshot.
+
+**On `undo` trigger** for lane i: if `st_undo_len > 0`, copy the undo snapshot back over the active audio buffer and force a redraw. If `st_undo_len == 0` (lane has never been overdubbed, or was cleared), the message is silently ignored.
+
+**On `clr` trigger** for lane i: clear the active audio buffer and reset `st_undo_len = 0` (the cleared state is not itself undoable).
+
+**Memory allocation:** Undo buffers must be pre-allocated in `@init` alongside the primary audio buffers. Each lane requires 2× its maximum audio buffer capacity (one active, one snapshot). Use `options:maxmem` to raise JSFX memory ceiling accordingly — document the required value in the plugin header comment once the per-lane buffer sizes are known. If available memory is insufficient for a given lane's loop length at snapshot time, skip the snapshot silently (undo will remain unavailable for that lane until the loop is shorter).
 
 #### Latch Compatibility
 
@@ -119,9 +156,10 @@ The latch queue (`latchq_add` / `latchq_process`) must work with routed messages
 
 #### Serialize / Backward Compatibility
 
-- Extend `mem_gen_sz` to accommodate `cfgp_common_rec`, `cfgp_common_ply`, `cfgp_common_sel`, `cfgp_common_mon`, and `g_common`. Default all to `128` (OFF) except `g_common` which defaults to `1`.
+- Extend `mem_gen_sz` to accommodate `cfgp_common_rec`, `cfgp_common_clr`, `cfgp_common_ply`, `cfgp_common_undo`, `cfgp_common_sel`, `cfgp_common_mon`, and `g_common`. Default all to `128` (OFF) except `g_common` which defaults to `1`.
 - Add `st_midichan` to the per-lane serialize loop (after the existing `st_note4`, `st_rdc`, `st_div`, `st_fade_size` blocks) wrapped in `file_avail(0) != 0 ?` guards for backward compatibility.
 - Default `st_midichan` per lane to `lane_index + 1` (lane 0 → channel 1, lane 1 → channel 2, etc.) so that fresh instances "just work" with the most natural 1:1 mapping.
+- `st_undo_buf` and `st_undo_len` are runtime-only (not serialized); undo snapshots do not persist across plugin reload. Both initialize to `0` in `@init`.
 
 ---
 
@@ -178,7 +216,7 @@ The current Super8 window is `420×480` px with a square-grid layout (`rowsize` 
 ├─────────────────────────────────────────────────────────┤
 │  Position / BPM bar                                     │
 ├─────────────────────────────────────────────────────────┤
-│  [common mode global strip: rec / ply / sel / mon]      │  ← visible only when common=on
+│  [common mode global strip: rec / clr / ply / undo / sel / mon]  │  ← visible only when common=on
 ├─────────────────────────────────────────────────────────┤
 │  Lane 1 row                                             │
 │  Lane 2 row                                             │
@@ -215,10 +253,10 @@ More specifically:
 When `common` is on, insert a dedicated horizontal strip between the position bar and the first lane row:
 
 ```
- [global rec tweaker]  [global ply tweaker]  [global sel tweaker]  [global mon tweaker]
+ [rec]  [clr]  [ply]  [undo]  [sel]  [mon]
 ```
 
-These four widgets are the same `draw_value_tweaker` style, but larger (e.g. 40 px wide, 32 px tall) with clearer labels and a visually distinct background panel (`PR.DisplayPanel` with a contrasting color) to signal their global scope.
+These six widgets are the same `draw_value_tweaker` style, but larger (e.g. 40 px wide, 32 px tall) with clearer labels and a visually distinct background panel (`PR.DisplayPanel` with a contrasting color) to signal their global scope. `clr` and `undo` should be visually distinguished from `rec`/`ply` — consider a slightly warmer panel color for the destructive/restorative pair.
 
 #### Global Action Button Strip
 
@@ -297,10 +335,10 @@ Set `@gfx 900 720` as the new default. This gives ~80 px per lane row for 8 chan
 
 ## Implementation Order Summary
 
-1. **Phase 1a** — Add `st_midichan` per-lane field, `cfgp_common_*` global fields, extend `@serialize`.
-2. **Phase 1b** — Add `g_common` toggle button to topbar; implement UI show/hide logic for per-lane vs. global tweakers and per-lane `channel` tweaker.
-3. **Phase 1c** — Fix MIDI channel extraction (`msg_type` / `msg_chan`); implement common-mode routing in `chan_onmsg`; ensure latch compatibility.
-4. **Phase 1d** — Add monitoring mode MIDI activation path (`cfgp_common_mon` in common mode); verify right-click per-lane cycling still works.
+1. **Phase 1a** — Add `st_midichan`, `st_undo_buf`, `st_undo_len` per-lane fields; add all six `cfgp_common_*` global fields; extend `@serialize` and pre-allocate undo buffers in `@init`; set `options:maxmem` appropriately.
+2. **Phase 1b** — Add `g_common` toggle button to topbar; implement UI show/hide logic for per-lane vs. global tweakers and per-lane `channel` tweaker; add all six tweakers to the common-mode global strip.
+3. **Phase 1c** — Fix MIDI channel extraction (`msg_type` / `msg_chan`); add CC value gate (`>= 1`); implement common-mode routing in `chan_onmsg` including `clr` and `undo` inline dispatch; ensure latch compatibility.
+4. **Phase 1d** — Add monitoring mode MIDI activation path (`cfgp_common_mon` in common mode); verify right-click per-lane cycling still works; verify `clr` immediately silences and wipes the lane; verify `undo` correctly restores the pre-overdub snapshot and is a no-op when no snapshot exists.
 5. **Phase 2a** — Install PR library (`import` directive, `filename:` entries, `PR.NewSlider` init calls). Validate it renders correctly in a stripped-down test branch.
 6. **Phase 2b** — Rewrite `draw()` to use horizontal row layout; integrate PR library panels, text, and monitor switch.
 7. **Phase 2c** — Style global action button strip and common-mode strip using PR library panels.

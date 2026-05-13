@@ -1,0 +1,1274 @@
+/***********************************************************************************
+
+Phil Ranger Audio and GUI Library Version Alpha 5
+Programmed and designed by Phil Ranger Copyright (C) 2025 (philipperanger@hotmail.com)
+
+Terms and conditions: This library is free to use in free software. Using this library in a non-free software automatically entices a 3% royalty to Phil Ranger, unless another amount is agreed on by both parties with a written proof.
+TLDR: It's free unless you sell something that uses it.
+
+TODO:
+Mousewheel Slider Adjustment
+Better slider definition
+
+************************************************************************************/
+
+@init
+
+	PR.Debug = "";
+	PR.Color.Contour="303040FF"; // Blueish Gray
+	PR.Color.Main="707070FF"; // Gray
+	PR.Color.Panel="300050A0"; // Dark Violet
+	PR.Color.Shadow = "10000080"; // Semi-transparent black
+	PR.Color.Text="FFFFFFF"; // White
+	PR.Text.Font="Arial";
+	
+	// Memory management section: You normally don't have to care about this, unless you use the memory vector
+	PR.Memory.Start=0; 	
+	
+	// To declutter the debugger, this library uses 12 memory locations for the functions PR.SetRange, PR.SetShape and PR.End.
+	// PR.Memory.End will also be modified by calling the "PR.New(..." functions as they require memory locations as well.
+	PR.Memory.End=12;
+	/*
+		PR.Memory.Start[0]=X;
+		PR.Memory.Start[1]=Y;
+		PR.Memory.Start[2]=Width;
+		PR.Memory.Start[3]=Height;
+		PR.Memory.Start[4] = 10; // Won't display texts or numbers smaller than this
+		PR.Memory.Start[5]=DefaultValue;
+		PR.Memory.Start[6]=MinValue;
+		PR.Memory.Start[7]=MaxValue;
+		PR.Memory.Start[8]=Linearity; // Linearity: 0=Linear, 1=Audio Taper
+	*/
+
+	
+/***********************************************************************************
+						Conversion functions
+************************************************************************************/
+
+function PR.LinearToPercent(Value Min Max) ((Value-Min)*100/(Max-Min););
+function PR.PercentToLinear(ValuePercent Min Max) ( Min+ValuePercent*(Max-Min)/100 );
+function PR.FrequencyToPercent(Value Min Max) (
+	(min==0) ? (PR.Debug="Freq can't start at zero";);
+	100*log(Value/Min)/log(Max/Min);
+);
+function PR.PercentToFrequency(ValuePercent Min Max) ( exp(log(Min)+(ValuePercent/100)*(log(Max/Min))) );
+function PR.dBToLinear(Value) (10^(Value/20));
+function PR.LinearTodB(Value) (20*log(max(Value,10^(-5)))/log(10));
+function PR.FToOmega(F) (2*$pi*F/srate);
+function PR.OmegaToF(w) (w*srate/(2*$pi));
+
+function PR.NumbertoText(Value) local(Text) (
+// Returns a string of reasonable length, even for larger numbers. Usage example: PR.DisplayText(Text3,PR.NumbertoText(slider1));
+	abs(Value)<10 ? (Text=sprintf(#, "%1.2f", Value)	):(
+		abs(Value)<100 ? (Text=sprintf(#, "%2.1f", Value)		):(
+			abs(Value)<1000 ? (Text=sprintf(#, "%.0f", Value)
+			):(abs(Value)<10000 ? (Text=sprintf(#, "%.2fk", floor((Value+5.1)/10)/100)
+				):(Text=sprintf(#, "%.1fk", floor((Value+50.1)/100)/10)
+				)
+			)
+		);	
+	);
+);
+
+function PR.IntegertoText(Value) (
+	sprintf(#, "%.0f", Value);
+);
+
+function PR.ExtractByteFromPackedHexadecimal(PackedHexadecimalNumber,position) local(num1,num2) (
+	num1=str_getchar(PackedHexadecimalNumber, position)-48; // char 48 = "0"
+	num1 >= 10 ? num1-=7;
+	num2=str_getchar(PackedHexadecimalNumber, position+1)-48; // char 48 = "0"
+	num2 >= 10 ? num2-=7;
+	num1*16+num2;// returned value
+);
+
+/***********************************************************************************
+						Library sub-functions
+************************************************************************************/
+
+function PR.UseColor(Color) (
+// Color is a packed Hexadecimal color in a string ("RRGGBBAA"). Example: "000080FF" is a vivid blue, no transparency (alpha)
+	gfx_set(PR.ExtractByteFromPackedHexadecimal(Color,0)/255,
+		PR.ExtractByteFromPackedHexadecimal(Color,2)/255,
+		PR.ExtractByteFromPackedHexadecimal(Color,4)/255,
+		PR.ExtractByteFromPackedHexadecimal(Color,6)/255);
+);
+
+function PR.SetSlider(SliderNumber Value) (
+	slider(SliderNumber)=Value;
+	sliderchange(2^(SliderNumber-1));
+	slider_automate(2^(SliderNumber-1)); // Thanks to Ben (Talagan) for helping me on the Reaper forum!
+);
+
+function PR.ValueChanger(X Y Width Height ValuePercent) local(MouseDetectionSize) (
+// Returns a value from 0 to 100, or -1 if default value is asked
+	// User wants to change value: left mouse pressed and position inside slider, sticky	
+	(mouse_x>= (X-Width/10)) && (mouse_x<= (X+1.1*Width)) && (mouse_y >= Y-Height/10) && (mouse_y<= (Y+1.1*Height)) ? (
+		mouse_cap & 1==1 ?( 	// mouse_cap&4=ctrl is pressed
+			((PR.Memory.Start[10]!=mouse_y) || (PR.Memory.Start[9]!=mouse_x)) && (mouse_cap & 4==4) ? (
+				(Width<=Height) ? (
+					// Vertical small change
+					ValuePercent=ValuePercent+(PR.Memory.Start[10]-mouse_y)*0.05;				
+				):(
+					// Horizontal small change
+					ValuePercent=ValuePercent-(PR.Memory.Start[9]-mouse_x)*0.05;				
+				);
+			);
+			((PR.Memory.Start[10]!=mouse_y) || (PR.Memory.Start[9]!=mouse_x)) && (mouse_cap & 4!=4) ? (
+				(Width<=Height) ? (
+					// Vertical large changes
+					ValuePercent=100*((Y+Height-mouse_y)/Height);
+				):(
+					// Horizontal large change
+					ValuePercent=100*((mouse_x-X)/Width);
+				);
+			);
+		);
+		ValuePercent = max(0,min(ValuePercent,100)); // limit from 0 to 100;
+		mouse_cap & 2==2 ? (// Right-click inside the box = back to default value.
+			ValuePercent=-1;
+		);
+		//Store current mouse position for next time:
+		PR.Memory.Start[9]=mouse_x;	
+		PR.Memory.Start[10]=mouse_y;
+	);	
+	ValuePercent;
+);
+
+/***********************************************************************************
+	 Constructor functions, should be needed by your plugin in the @init block
+	 Pseudo-object[0] and [1] are the outputs (if applicable), [15] is the type
+************************************************************************************/
+
+function PR.NewSlider(SliderNumber DefaultValue MinValue MaxValue Linearity) (
+	// Returns a pointer to the values.	
+
+	PR.Memory.End[0] = SliderNumber;
+	PR.Memory.End[1] = DefaultValue;
+	PR.Memory.End[2] = MinValue;
+	PR.Memory.End[3] = MaxValue;
+	PR.Memory.End[4] = Linearity;
+	PR.Memory.End[15] = "Slider";
+	( (Linearity==1) && (MinValue<=0) ) ? (PR.Debug="error: NewSlider non lin and zero";);
+	PR.Memory.End +=16;	
+	PR.Memory.End-16;
+);
+function PR.NewSlider(SliderNumber DefaultValue MinValue MaxValue) (
+	// Not passing a value for linearity means it will be linear
+	PR.NewSlider(SliderNumber,DefaultValue,MinValue,MaxValue,0);
+);
+
+function PR.NewMonoEQ() ( // Returns a pointer to the values.	
+	// [0] = y1
+	// [1] = y2
+	// [2] = x1
+	// [3] = x2
+	// [4] = a1	
+	// [5] = a2
+	// [6] = b0
+	// [7] = b1
+	// [8] = b2
+	PR.Memory.End[15]="MonoEQ";
+	PR.Memory.End +=16;	
+	PR.Memory.End-16;
+);
+
+function PR.NewStereoEQ() ( // Returns a pointer to the values.	
+	/*
+	Pointer values are:
+		0,1: y1 (is also the output)
+		2,3: y2
+		4,5: x0
+		6,7: x1
+		8,9: x2
+		10,11: a1,a2 (equations are normalized to a0=1)
+		12,13,14: b0, b1, b2  */
+	PR.Memory.End[15]="StereoEQ";
+	PR.Memory.End +=16;	
+	PR.Memory.End-16;
+);
+
+function PR.NewMonoEnvelopeFollower() ( // Returns a pointer to the values.
+	// PR.Memory.End[0] = y1
+	// PR.Memory.End[1] = Attack Coefficient
+	// PR.Memory.End[2] = Release Coefficient
+	PR.Memory.End[15]="MonoEnvelopeFollower";
+	PR.Memory.End +=16;	
+	PR.Memory.End-16;
+);
+
+function PR.NewMonoDelay(MaxDelayms) local(temp)(
+	/* Returns a pointer to the values.
+		0: maximum length
+		1: length
+		2: feedback
+		3: Pointer to the actual value in the buffer
+		16...maximumlength+16: Past samples */
+	PR.Memory.End[15]="MonoDelay";
+	temp=PR.Memory.End;
+	MaxDelayms=max(1,MaxDelayms); // At least 1 ms
+	PR.Memory.End[0] = floor(MaxDelayms*srate/1000);
+	PR.Memory.End[3] = 16; // Pointer to the actual value in the buffer
+	PR.Memory.End += (16+MaxDelayms*srate/1000); // 16 parameters then sample values
+	temp; // Return the pointer
+);
+
+function PR.NewStereoDelay(MaxDelayms) local(temp)(
+	/* Returns a pointer to the values.
+		0: Output Left
+		1: Output Right
+		2: Maximum length, per channel
+		3: Buffer length, per channel
+		4: feedback
+		5: Pointer to the actual value in the left buffer (right buffer position will be calculated)
+		16...2*maximumlength+16: Past samples */
+	PR.Memory.End[15]="StereoDelay";
+	temp=PR.Memory.End;
+	MaxDelayms=max(1,MaxDelayms); // At least 1 ms
+	PR.Memory.End[2] = floor(MaxDelayms*srate/1000);
+	PR.Memory.End[5] = 16; // Pointer to the actual value in the buffer
+	PR.Memory.End += (16+2*MaxDelayms*srate/1000); // 16 parameters then sample values
+	temp; // Return the pointer
+);
+
+function PR.NewList(a b) (mem_set_values(PR.Memory.End, a, b);PR.Memory.End +=2;PR.Memory.End-2;);
+function PR.NewList(a b c) (mem_set_values(PR.Memory.End, a, b, c);PR.Memory.End +=3;PR.Memory.End-3;);
+function PR.NewList(a b c d) (mem_set_values(PR.Memory.End, a, b, c, d);PR.Memory.End +=4;PR.Memory.End-4;);
+function PR.NewList(a b c d e) (mem_set_values(PR.Memory.End, a, b, c, d, e);PR.Memory.End +=5;PR.Memory.End-5;);
+function PR.NewList(a b c d e f) (mem_set_values(PR.Memory.End, a, b, c, d, e, f);PR.Memory.End +=6;PR.Memory.End-6;);
+function PR.NewList(a b c d e f g) (mem_set_values(PR.Memory.End, a, b, c, d, e, f, g);PR.Memory.End +=7;PR.Memory.End-7;);
+function PR.NewLists(a b c d e f g h) (mem_set_values(PR.Memory.End, a, b, c, d, e, f, g, h);PR.Memory.End +=8;PR.Memory.End-8;);
+function PR.NewList(a b c d e f g h i) (mem_set_values(PR.Memory.End, a, b, c, d, e, f, g, h, i);PR.Memory.End +=9;PR.Memory.End-9;);
+function PR.NewList(a b c d e f g h i j) (mem_set_values(PR.Memory.End, a, b, c, d, e, f, g, h, i, j);PR.Memory.End +=10;PR.Memory.End-10;);
+
+/***********************************************************************************				
+ Display Setup functions, should be needed by your plugin in the @gfx
+************************************************************************************/
+
+function PR.SetShape(X Y Width Height) (
+	// All in %.  X and Y are the center of the shape
+	PR.Memory.Start[0]=X;
+	PR.Memory.Start[1]=Y;
+	PR.Memory.Start[2]=Width;
+	PR.Memory.Start[3]=Height;
+	PR.Memory.Start[4] = 10; // Won't display texts or numbers smaller than this
+);
+function PR.SetShape(X Y Size) (  PR.SetShape(X,Y,Size,Size);  );
+
+function PR.SetRange(DefaultValue MinValue MaxValue Linearity) (
+	// Linearity: 0 = Linear, 1 = Audio Taper
+	PR.Memory.Start[5]=DefaultValue;
+	PR.Memory.Start[6]=MinValue;
+	PR.Memory.Start[7]=MaxValue;
+	PR.Memory.Start[8]=Linearity;
+);
+
+
+/***********************************************************************************				
+ Display functions, should be needed by your plugin in the @gfx
+************************************************************************************/
+
+function PR.DisplayText(X Y Size Text Style) local(ScalingFactor) (
+	ScalingFactor = min(gfx_w, gfx_h)/100;
+	(Size*ScalingFactor >= 10) ? (
+		PR.UseColor(PR.Color.Text);
+		gfx_x=X*ScalingFactor;
+		gfx_y=Y*ScalingFactor;
+		gfx_setfont(16, PR.Text.Font, Size*ScalingFactor, Style); // Style: 'b','u','i'
+		// 0=top left.  bitmask: 1=center horizontally, 2=right, 4=center vertically, 8 = bottom, 256 = do not clip
+		gfx_drawstr(Text,1|4|256,gfx_x,gfx_y);
+	);
+);
+function PR.DisplayText(X Y Size Text) ( // no style attribute
+	PR.DisplayText(X, Y, Size, Text, '');
+);
+function PR.DisplayText(Text Style) ( // Use PR.SetShape for
+	PR.DisplayText(PR.Memory.Start[0],PR.Memory.Start[1],PR.Memory.Start[2], Text, Style);
+);
+function PR.DisplayText(Text) (
+	PR.DisplayText(PR.Memory.Start[0],PR.Memory.Start[1],PR.Memory.Start[2], Text, '');
+);
+
+
+function PR.DisplayPanel(X Y W H) local(ScalingFactor Contour) (
+/*********************************************
+	Uses PR.Color.Contour; PR.Color.Panel
+*********************************************/
+	// Size of the element in pixels
+	ScalingFactor = min(gfx_w, gfx_h)/100;
+	X = ScalingFactor*(X-W/2); // X and Y are center coordinates and we need top-left
+	Y = ScalingFactor*(Y-H/2);
+	W = ScalingFactor*W;
+	H = ScalingFactor*H;
+	Contour = max(0.2*ScalingFactor,2); // Contour Size is set to 0.2% of the GUI. This is an arbitrary artistic decision.	
+
+	PR.UseColor(PR.Color.Contour);
+	gfx_rect(X,Y,W,H);
+	
+	PR.UseColor(PR.Color.Panel);
+	X += Contour;
+	Y += Contour;
+	W -= (2*Contour); // remove twice the contour
+	H -= (2*Contour); // remove twice the contour
+	gfx_rect(X,Y,W,H); 	
+);
+
+function PR.DisplayPanel() local(ScalingFactor Contour X Y W H) (
+/*********************************************
+	Uses PR.Color.Contour; PR.Color.Panel
+*********************************************/
+	// Size of the element in pixels
+	ScalingFactor = min(gfx_w, gfx_h)/100;
+	X = ScalingFactor*(PR.Memory.Start[0]-PR.Memory.Start[2]/2); // X and Y are center coordinates and we need top-left
+	Y = ScalingFactor*(PR.Memory.Start[1]-PR.Memory.Start[3]/2);
+	W = ScalingFactor*PR.Memory.Start[2];
+	H = ScalingFactor*PR.Memory.Start[3];
+	Contour = max(0.2*ScalingFactor,2); // Contour Size is set to 0.2% of the GUI. This is an arbitrary artistic decision.	
+
+	PR.UseColor(PR.Color.Contour);
+	gfx_rect(X,Y,W,H);
+	
+	PR.UseColor(PR.Color.Panel);
+	X += Contour;
+	Y += Contour;
+	W -= (2*Contour); // remove twice the contour
+	H -= (2*Contour); // remove twice the contour
+	gfx_rect(X,Y,W,H); 	
+);
+
+function PR.DisplayPicture(X Y W PictureNumber) local(ScalingFactor Size PictureWidth PictureHeight Ratio) (
+/*********************************************
+	After the "desc" line at the beginning of your plugin, load the pictures. They have to be in the same folder as your plugin.	Example:		import PhilRangerGUILibraryv1.1
+			desc:My Unicorn Plugin
+			filename:0,JustinFrankelOnAUnicorn.png
+			slider1:gaindB=-12<-80,24,1>-gain (dB)
+	Tip: to get a semi-transparent picture, adjust the value of gfx_a before calling thin function (0=full transparent, 1=full opaque)
+*********************************************/
+	ScalingFactor = min(gfx_w, gfx_h)/100;
+	Size = ScalingFactor*W;	
+	gfx_x = ScalingFactor*X-Size/2; // X and Y are center coordinates and we need top-left
+	gfx_y = ScalingFactor*Y-Size/2;
+	gfx_getimgdim(PictureNumber,PictureWidth,PictureHeight);
+	Ratio=Size/max(PictureWidth, PictureHeight);
+	gfx_blit(PictureNumber,Ratio,0);
+);
+
+function PR.DisplayPicture(PictureNumber) local(ScalingFactor Size PictureWidth PictureHeight Ratio) (
+/*********************************************
+	After the "desc" line at the beginning of your plugin, load the pictures. They have to be in the same folder as your plugin.	Example:		import PhilRangerGUILibraryv1.1
+			desc:My Unicorn Plugin
+			filename:0,JustinFrankelOnAUnicorn.png
+			slider1:gaindB=-12<-80,24,1>-gain (dB)
+	Tip: to get a semi-transparent picture, adjust the value of gfx_a before calling thin function (0=full transparent, 1=full opaque)
+*********************************************/
+	ScalingFactor = min(gfx_w, gfx_h)/100;
+	Size = ScalingFactor*PR.Memory.Start[2];	
+	gfx_x = ScalingFactor*PR.Memory.Start[0]-Size/2; // X and Y are center coordinates and we need top-left
+	gfx_y = ScalingFactor*PR.Memory.Start[1]-Size/2;
+	gfx_getimgdim(PictureNumber,PictureWidth,PictureHeight);
+	Ratio=Size/max(PictureWidth, PictureHeight);
+	gfx_blit(PictureNumber,Ratio,0);
+);
+
+function PR.DisplaySwitch(SliderNumber PictureNumber XPercent YPercent WPercent HPercent) local(X Y W H Value ScalingFactor ContourSize Ratio PictureWidth PictureHeight temp) (
+	/*********************************************
+	Uses PR.Color.Contour; PR.Color.Main; PR.Color.Shadow;
+		Last mouse values: PR.Memory.Start[9]; PR.Memory.Start[10];
+	*********************************************/
+
+	Value=slider(SliderNumber);
+	// Size of the elements in pixels
+	ScalingFactor = min(gfx_w, gfx_h)/100;
+	X = XPercent*ScalingFactor; // X and Y are centered
+	Y = YPercent*ScalingFactor;
+	W = WPercent*ScalingFactor;	
+	H = HPercent*ScalingFactor;	
+	ContourSize = max(2,0.2*ScalingFactor); // Arbitrary artistic decision.
+	// left button pressed and position inside button
+	((mouse_x>= X-W/2) && (mouse_x<= X+W/2) && (mouse_y>= Y-H/2) && (mouse_y<= Y+H/2)) ? (
+		temp=PR.Memory.Start[11];
+		PR.Memory.Start[11]=mouse_cap;
+		((mouse_cap && 1) == 1 && (temp && 1) == 0) ? (
+			Value = !Value;
+		);
+	);
+	
+	// Draw Button
+	PR.UseColor(PR.Color.Contour);
+	gfx_rect(X-W/2,Y-H/2,W,H);
+	PR.UseColor(PR.Color.Shadow);
+	gfx_rect(X-W/2+ContourSize, Y-H/2+ContourSize, W-2*ContourSize, H-2*ContourSize);
+	(PictureNumber==-1) ? ( // No Picture, default style
+		PR.UseColor(PR.Color.Contour);
+		(H < W) ? ( // Horizontal
+			gfx_rect(X-W/2+Value*W/2, Y-H/2, W/2, H);
+			PR.UseColor(PR.Color.Main);
+			gfx_rect(1+X-W/2+Value*W/2, Y-H/2+1, W/2-2, H-2);
+		):( // Vertical
+			gfx_rect(X-W/2,Y-H/2+(!Value*H/2), W, H/2);
+			PR.UseColor(PR.Color.Main);
+			gfx_rect(1+X-W/2,1+Y-H/2+(!Value*H/2), W-2, H/2-2);
+		);
+	):(  // With Picture
+		gfx_getimgdim(PictureNumber,PictureWidth,PictureHeight);
+		(H < W) ? ( // Horizontal
+			Ratio=H/PictureHeight;
+			X=X+(Value*(W-PictureWidth*Ratio));
+		):( // Vertical
+			Ratio=W/PictureWidth;
+			Y=Y+(!Value*(H-PictureHeight*Ratio));
+		);
+			gfx_x = X-W/2;
+			gfx_y = Y-H/2;
+			gfx_a = 1;
+			gfx_blit(PictureNumber,Ratio ,0);
+	);
+	
+	PR.SetSlider(SliderNumber,Value);
+);
+function PR.DisplaySwitch(SliderNumber X Y W H) (PR.DisplaySwitch(SliderNumber,-1,X,Y,W,H););
+function PR.DisplaySwitch(SliderNumber PictureNumber)(
+	PR.DisplaySwitch(SliderNumber,PictureNumber,
+		PR.Memory.Start[0],PR.Memory.Start[1],
+		PR.Memory.Start[2],PR.Memory.Start[3]);
+);
+function PR.DisplaySwitch(SliderNumber) (
+	PR.DisplaySwitch(SliderNumber,-1,
+		PR.Memory.Start[0],PR.Memory.Start[1],
+		PR.Memory.Start[2],PR.Memory.Start[3]);
+);
+
+/*********************************************/
+function PR.DisplaySlider(SliderNumber PictureNumber XPercent YPercent WPercent HPercent)
+local(Value ValuePercent DefaultValuePercent ScalingFactor X Y W H ContourSize MouseDetectionSize Size Ratio PictureHeight PictureWidth TickNumber) (
+	/*
+	Uses PR.Color.Contour; PR.Color.Main; PR.Color.Shadow;
+		Last mouse values: PR.Memory.Start[9]; PR.Memory.Start[10];
+		Range(Default,min,max,linearity): PR.Memory.Start[5] to [8]
+	*/
+	//Was a slider pseudo object passed instead of a JSFX slider number? Then re-map
+	(SliderNumber[15]=="Slider")?(
+			PR.Memory.Start[5]=SliderNumber[1]; // DefaultValue;
+			PR.Memory.Start[6]=SliderNumber[2]; // MinValue;
+			PR.Memory.Start[7]=SliderNumber[3]; // MaxValue;
+			PR.Memory.Start[8]=SliderNumber[4]; // Linearity;
+			SliderNumber=SliderNumber[0]; // No more a pointer!
+			( (PR.Memory.Start[8]==1) && (PR.Memory.Start[6]==0) ) ? PR.Debug=printf("error: DisplaySlider %d non lin and zero",SliderNumber);
+	);
+	Value=slider(SliderNumber);
+	PR.Memory.Start[8]==0 ? (
+		// Linear
+		ValuePercent = PR.LineartoPercent(Value, PR.Memory.Start[6], PR.Memory.Start[7]);
+		DefaultValuePercent=PR.LineartoPercent(PR.Memory.Start[5], PR.Memory.Start[6], PR.Memory.Start[7]);
+	);
+	PR.Memory.Start[8]==1 ? (
+		// Non linear
+		ValuePercent = PR.FrequencyToPercent(Value, PR.Memory.Start[6], PR.Memory.Start[7]);
+		DefaultValuePercent=PR.FrequencyToPercent(PR.Memory.Start[5], PR.Memory.Start[6], PR.Memory.Start[7]);
+	);
+	// Size the elements in pixels
+	ScalingFactor = min(gfx_w, gfx_h)/100;
+	X = ScalingFactor*XPercent; // X Y are centered
+	Y = ScalingFactor*YPercent;
+	W = ScalingFactor*WPercent;
+	H = ScalingFactor*HPercent;
+	ContourSize = max(2,0.2*ScalingFactor); // Arbitrary artistic decision.	
+
+	(PictureNumber!=-1) ? ( // Picture as a button
+		gfx_getimgdim(PictureNumber,PictureWidth,PictureHeight);
+		(H>W)? (
+			Ratio=W/PictureWidth;
+			Size=Ratio*PictureHeight/H;
+		):(
+			Ratio=H/PictureHeight;
+			Size=Ratio*PictureWidth/W;
+		);
+	):(	
+		Size=0.1; // Size of the fader button, arbitrary artistic decision.
+	);	
+	
+	ValuePercent = PR.ValueChanger(X-W/2, Y-H/2, W, H, ValuePercent);// Will send back "-1" if default value
+	(ValuePercent == -1) ? ValuePercent = DefaultValuePercent;	
+	
+	PR.Memory.Start[8]==0 ? (
+		// Linear
+		Value=PR.PercentToLinear(ValuePercent, PR.Memory.Start[6], PR.Memory.Start[7]);
+	);
+	PR.Memory.Start[8]==1 ? (
+		// Frequency style
+		Value=PR.PercentToFrequency(ValuePercent, PR.Memory.Start[6], PR.Memory.Start[7]);
+	);
+	
+	(H > W) ? ( // Vertical Slider
+		// Tick marks
+		PR.UseColor(PR.Color.Text);
+		TickNumber = 0;
+		loop(10,
+			gfx_line(X-W/2-W/10,
+				Y + H*(1-size)*(TickNumber/9 -0.5),
+				X-W/2+W*1.1,
+				Y + H*(1-size)*(TickNumber/9 -0.5));
+			TickNumber +=1;
+		);
+		// Min and Max Values
+		PR.DisplayText(
+			XPercent-WPercent*.95,
+			YPercent+HPercent*(1-size)/2,
+			WPercent/3,
+			PR.NumbertoText(PR.Memory.Start[6]));
+		PR.DisplayText(
+			XPercent-WPercent*.95,
+			YPercent-HPercent*(1-size)/2,
+			WPercent/3,
+			PR.NumbertoText(PR.Memory.Start[7]));
+
+		PR.UseColor(PR.Color.Contour);
+		gfx_rect(X-W/2,Y-H/2,W,H);
+		PR.UseColor(PR.Color.Shadow);
+		gfx_rect(X-W/2+ContourSize, Y-H/2+ContourSize, W-2*ContourSize, H-2*ContourSize);
+		// Middle Line
+		PR.UseColor(PR.Color.Text);
+		gfx_a=0.1; // Quite transparent
+		gfx_rect(X-1, Y-H/2, 2, H);
+		PR.UseColor(PR.Color.Main);
+		(PictureNumber==-1) ? (
+			// Button
+			PR.UseColor(PR.Color.Contour);
+			gfx_rect(X-W/2,Y-H/2+H*(1-(ValuePercent/100))*(1-Size),W,Size*H);
+			PR.UseColor(PR.Color.Main);
+			gfx_rect(X-W/2+1,Y-H/2+1+H*(1-(ValuePercent/100))*(1-Size),W,Size*H);
+			PR.UseColor(PR.Color.Shadow);
+			gfx_rect(X-W/2+1,Y-(1-size)*H/2+H*(1-(ValuePercent/100))*(1-Size),W,1);
+		):( // Picture as a button
+			gfx_x = X-W/2;
+			gfx_y = Y-H/2+H-ValuePercent*(H-PictureHeight*Ratio)/100-PictureHeight*Ratio;
+			gfx_a = 1;
+			gfx_blit(PictureNumber,Ratio ,0);
+		);	
+		// Display Value
+		PR.UseColor(PR.Color.Text);
+		PR.DisplayText( // X,Y,size,text
+			XPercent,YPercent+HPercent*((1-size)/2-(1-size)*ValuePercent/100), WPercent/2.5,
+			PR.NumbertoText(Value));
+	):( // Horizontal Slider
+		// Tick marks
+		PR.UseColor(PR.Color.Text);
+		TickNumber = 0;
+		loop(10,
+			gfx_line(X + W*(1-size)*(TickNumber/9 -0.5),
+				Y-H*.6,
+				X + W*(1-size)*(TickNumber/9 -0.5),
+				Y+H*.6);
+			TickNumber +=1;
+		);	
+		PR.UseColor(PR.Color.Contour);
+		gfx_rect(X-W/2,Y-H/2,W,H);
+		PR.UseColor(PR.Color.Shadow);
+		gfx_rect(X-W/2+ContourSize, Y+ContourSize-H/2, W-2*ContourSize, H-2*ContourSize);
+		// Middle Line
+		PR.UseColor(PR.Color.Text);
+		gfx_a=0.1; // Quite transparent
+		gfx_rect(X-W/2, Y, W, 2);
+		PR.UseColor(PR.Color.Main);
+		(PictureNumber==-1) ? (
+			// Button
+			PR.UseColor(PR.Color.Contour);
+			gfx_rect(X-W/2+W*(ValuePercent/100)*(1-Size),Y-H/2,Size*W,H);
+			PR.UseColor(PR.Color.Main);
+			gfx_rect(1+X-W/2+W*(ValuePercent/100)*(1-Size), 1+Y-H/2, Size*W-2, H-2);		
+			PR.UseColor(PR.Color.Shadow);
+			gfx_rect(X-W*(1-Size)/2+W*(ValuePercent/100)*(1-Size), 1+Y-H/2, 1, H-2);		
+		):( // Picture as a button
+			Ratio=H/PictureHeight;
+			gfx_x = X-W/2+ValuePercent*(W-PictureWidth*Ratio)/100;
+			gfx_y = Y-H/2;
+			gfx_a = 1;
+			gfx_blit(PictureNumber,Ratio ,0);
+		);
+		// Display Value
+		PR.UseColor(PR.Color.Text);
+		PR.DisplayText(
+		XPercent+WPercent*(1-Size)*(ValuePercent/100-0.5),
+			YPercent, HPercent*.5, PR.NumbertoText(Value)); // X,Y,size,text
+		// Min and Max Values
+		PR.DisplayText(XPercent-WPercent*.45, // .45: remove 5% for slider button size
+			YPercent+HPercent*.9, HPercent/2,
+			PR.NumbertoText(PR.Memory.Start[6]));
+		PR.DisplayText(XPercent+WPercent*.45,
+			YPercent+HPercent*.9,
+			HPercent/2,
+			PR.NumbertoText(PR.Memory.Start[7]));
+	);
+	PR.SetSlider(SliderNumber, Value);
+);
+function PR.DisplaySlider(SliderNumber XPercent YPercent WPercent HPercent) (
+	PR.DisplaySlider(SliderNumber,-1,XPercent,YPercent,WPercent,HPercent);
+);
+function PR.DisplaySlider(SliderNumber PictureNumber) (
+	PR.DisplaySlider(SliderNumber,PictureNumber,
+		PR.Memory.Start[0],PR.Memory.Start[1],PR.Memory.Start[2],PR.Memory.Start[3]);
+);
+function PR.DisplaySlider(SliderNumber) (
+	PR.DisplaySlider(SliderNumber,-1,
+		PR.Memory.Start[0],PR.Memory.Start[1],PR.Memory.Start[2],PR.Memory.Start[3]);
+);
+
+
+/*********************************************/
+function PR.DisplayMeter(Value Min Max XPercent YPercent SPercent)
+local(ValuePercent ScalingFactor Size Radius X Y ContourSize TickAngle TickNumber NeedleAngle XAngle YAngle) (
+	/*
+	Uses
+		PR.Color.Contour; PR.Color.Main; PR.Color.Shadow;
+	*/
+		
+	ValuePercent = PR.LineartoPercent(Value, Min, Max); // Value, Min, Max
+	// Limit check:
+	ValuePercent = min(ValuePercent,100);
+	ValuePercent = max(ValuePercent,0);
+
+	// Size of the elements in pixels
+	ScalingFactor = min(gfx_w, gfx_h)/100;
+	X = XPercent*ScalingFactor;
+	Y = YPercent*ScalingFactor;
+	Size = SPercent*ScalingFactor;
+	Radius = 0.5*Size; // Meter radius
+	ContourSize = max(1.5*ScalingFactor,2); // This is an arbitrary artistic decision.
+	// Shadow around the contour of the meter
+	PR.UseColor(PR.Color.Shadow);
+	gfx_circle(X+Radius/35,Y+Radius/25,Radius*1.0,1,1);
+	// Contour
+	PR.UseColor(PR.Color.Contour);
+	gfx_circle(X,Y,Radius,1,1);
+	// Meter
+	PR.UseColor(PR.Color.Shadow);
+	gfx_circle(X,Y,Radius-ContourSize,1,1);
+	// Draw the ticks around the circle
+	PR.UseColor(PR.Color.Text);
+	TickNumber = 0;
+	loop(11,
+		TickAngle = (TickNumber*1.5-75)*2*$pi/360; // scaled to an angle in rad from -50 degrees to 50 degrees
+		gfx_line(X+Radius*sin(TickAngle), Y-Radius*cos(TickAngle), X+(Radius-ContourSize)*sin(TickAngle), Y-(Radius-ContourSize)*cos(TickAngle)); // Draw the tick
+		TickNumber +=10;
+	);
+	// Needle
+	NeedleAngle=(ValuePercent*1.5-75)*2*$pi/360; // scaled to an angle in rad from -75 degrees to 75 degrees
+	PR.UseColor(PR.Color.Text);	
+	gfx_line(X,Y,X+sin(NeedleAngle)*(Radius-ContourSize),Y-cos(NeedleAngle)*(Radius-ContourSize),1);
+	// Needle center dot
+	PR.UseColor(PR.Color.Main);
+	gfx_circle(X,Y,Radius/6,1,1);	
+	// Min Value
+	PR.UseColor(PR.Color.Text);	
+	PR.DisplayText(
+		XPercent-0.7*SPercent,
+		YPercent-SPercent/10,
+		SPercent/6,
+		PR.NumbertoText(Min)); // X,Y,size,text
+	// Max Value
+	PR.DisplayText(
+		XPercent+0.7*SPercent,
+		YPercent-SPercent/10,
+		SPercent/6,
+		PR.NumbertoText(Max));
+);
+function PR.DisplayMeter(Value Min Max) (
+	PR.DisplayMeter(Value, Min, Max,
+		PR.Memory.Start[0],PR.Memory.Start[1],PR.Memory.Start[2]);
+);
+
+function PR.DisplayKnob(SliderNumber PictureNumber XPercent YPercent SPercent) local(Value ValuePercent DefaultValuePercent ScalingFactor X Y ContourSize Size Radius Xangle Yangle KnobAngle PictureWidth PictureHeight Ratio TickAngle TickNumber) (
+	/*********************************************
+	Uses PR.Color.Contour; PR.Color.Main; PR.Color.Shadow; PR.Color.Text; Last mouse values: PR.Memory.Start[9]; PR.Memory.Start[10];
+	ValueRange(DefaultValue MinValue MaxValue Linearity)
+	/*********************************************/
+
+	//Was a slider pseudo object passed instead of a JSFX slider number? Then re-map
+	(SliderNumber[15]=="Slider")?(
+			PR.Memory.Start[5]=SliderNumber[1]; // DefaultValue;
+			PR.Memory.Start[6]=SliderNumber[2]; // MinValue;
+			PR.Memory.Start[7]=SliderNumber[3]; // MaxValue;
+			PR.Memory.Start[8]=SliderNumber[4]; // Linearity;
+			SliderNumber=SliderNumber[0]; // No more a pointer!
+			( (PR.Memory.Start[8]==1) && (PR.Memory.Start[6]==0) ) ? PR.Debug=printf("error: DisplayKnob %d non lin and zero",SliderNumber);
+	);
+	
+	Value=slider(SliderNumber);
+	PR.Memory.Start[8]==0 ? ( // Linear
+		ValuePercent = PR.LineartoPercent(Value, PR.Memory.Start[6], PR.Memory.Start[7]); // PR.LineartoPercent(Value MinValue MaxValue)
+		DefaultValuePercent=PR.LineartoPercent(PR.Memory.Start[5], PR.Memory.Start[6], PR.Memory.Start[7]);
+	);
+	PR.Memory.Start[8]==1 ? ( // Frequency
+		ValuePercent = PR.FrequencyToPercent(Value, PR.Memory.Start[6], PR.Memory.Start[7]);
+		DefaultValuePercent=PR.FrequencyToPercent(PR.Memory.Start[5], PR.Memory.Start[6], PR.Memory.Start[7]);
+	);
+	// Size the elements in pixels
+	ScalingFactor = min(gfx_w, gfx_h)/100;
+	X = ScalingFactor*XPercent; // X Y are centered
+	Y = ScalingFactor*YPercent;
+	Size = ScalingFactor*SPercent;
+	Radius = 0.5*Size; // Knob radius
+	ContourSize=Radius*.35; // Arbitrary artistic decision
+
+	ValuePercent = PR.ValueChanger(
+		X-Radius,
+		Y-Radius,
+		Size,
+		Size,
+		ValuePercent);// X,Y,Width,Height,ValuePercent. Will send back "-1" if default value
+	(ValuePercent < 0) ? ValuePercent = DefaultValuePercent;
+	PR.Memory.Start[8]==0 ? (
+		// Linear
+		Value=PR.PercentToLinear(ValuePercent, PR.Memory.Start[6], PR.Memory.Start[7]);
+	);
+	PR.Memory.Start[8]==1 ? (
+		// Frequency Style
+		Value=PR.PercentToFrequency(ValuePercent, PR.Memory.Start[6], PR.Memory.Start[7]);
+	);
+	// Draw it
+	KnobAngle=(ValuePercent*3-150)*2*$pi/360; // scaled to an angle in rad. *3-150 = from -150 degrees to 150 degrees
+	// Draw the ticks around the circle
+	PR.UseColor(PR.Color.Text);
+	TickNumber = 0;
+	loop(11,
+		TickAngle = (-150+TickNumber*30)*2*$pi/360; // scaled to an angle in rad from -150 degrees to 150 degrees
+		gfx_line(X+1.1*Radius*sin(TickAngle), Y-1.1*Radius*cos(TickAngle), X,Y); // Draw the tick
+		TickNumber +=1;
+	);
+	// Shadow around the contour of the knob
+	PR.UseColor(PR.Color.Shadow);
+	gfx_circle(X+Radius/30,Y+Radius/20,Radius*1.0,1,1);
+
+	(PictureNumber == -1) ? (
+		XAngle=X+sin(KnobAngle)*Radius;
+		YAngle=Y-cos(KnobAngle)*Radius; // minus means center on top
+		// Contour
+		PR.UseColor(PR.Color.Contour);
+		gfx_circle(X,Y,Radius,1,1);
+		// Pointer
+		PR.UseColor(PR.Color.Text);	
+		gfx_line(X,Y,XAngle,YAngle,1);
+		gfx_arc(X, Y, Radius, -2.618, KnobAngle); // 2.618: Arc starts at -150 degrees
+		// gfx_arc(x,y,r, ang1, ang2[,antialias]) -- REAPER 4.60+ Draws an arc of the circle centered at x,y, with ang1/ang2 being specified in radians.
+		// Shadow on the knob
+		PR.UseColor(PR.Color.Shadow);
+		gfx_circle(X+Radius/10,Y+Radius/8,(Radius-ContourSize)*1.0,1,1);
+		// Knob
+		PR.UseColor(PR.Color.Main);
+		gfx_circle(X,Y,Radius-ContourSize,1,1);
+	):(
+		gfx_x = X-Radius;
+		gfx_y = Y-Radius;
+		gfx_a = 1;
+		gfx_getimgdim(PictureNumber,PictureWidth,PictureHeight);
+		Ratio=SPercent*ScalingFactor/PictureWidth;
+		gfx_blit(PictureNumber,Ratio,KnobAngle);// KnobAngle
+	);	
+	// Knob value	
+	PR.UseColor(PR.Color.Text);	
+	PR.DisplayText(
+		XPercent,
+		YPercent,
+		0.9*(Radius-ContourSize)/ScalingFactor,
+		PR.NumbertoText(Value)); // X Y Size Text
+	// Min Value
+	PR.DisplayText(
+		XPercent-0.5*SPercent,
+		YPercent+SPercent/2,
+		SPercent/5,
+		PR.NumbertoText(PR.Memory.Start[6]));
+	// Max Value	
+	PR.DisplayText(
+		XPercent+0.5*SPercent,
+		YPercent+SPercent/2,
+		SPercent/5,
+		PR.NumbertoText(PR.Memory.Start[7]));	
+	PR.SetSlider(SliderNumber, Value);
+);
+function PR.DisplayKnob(SliderNumber XPercent YPercent SPercent) (
+	PR.DisplayKnob(SliderNumber, -1, XPercent, YPercent, SPercent);
+);
+function PR.DisplayKnob(SliderNumber PictureNumber) (
+	PR.DisplayKnob(SliderNumber, PictureNumber,
+		PR.Memory.Start[0],PR.Memory.Start[1],PR.Memory.Start[2]);
+);
+function PR.DisplayKnob(SliderNumber) (
+	PR.DisplayKnob(SliderNumber, -1,
+		PR.Memory.Start[0],PR.Memory.Start[1],PR.Memory.Start[2]);
+);
+
+
+function PR.DisplayRotarySwitch(SliderNumber Steps PictureNumber XPercent YPercent SPercent) local(Value ValuePercent ScalingFactor X Y ContourSize Size Radius Xangle Yangle KnobAngle PictureWidth PictureHeight Ratio Steps TickAngle TickNumber MinAngle TickAngleStep)(
+	/*********************************************
+	Uses PR.Color.Contour; PR.Color.Main; PR.Color.Shadow; PR.Color.Text;
+	Last mouse values: PR.Memory.Start[9]; PR.Memory.Start[10];
+	Steps: number of positions for the rotary switch
+	/*********************************************/
+
+	Value = slider(SliderNumber);
+	ValuePercent = PR.LineartoPercent(Value, 0, Steps-1); // PR.LineartoPercent(Value MinValue MaxValue)
+
+	// Size the elements in pixels
+	ScalingFactor = min(gfx_w, gfx_h)/100;
+	X = ScalingFactor*XPercent; // X Y are centered
+	Y = ScalingFactor*YPercent;
+	Size = ScalingFactor*SPercent;
+	Radius = 0.5*Size; // Knob radius
+	ContourSize=Radius*.35; // Arbitrary artistic decision
+
+	// X,Y,Width,Height,ValuePercent. Will send back "-1" if default value
+	ValuePercent = PR.ValueChanger(X-Radius,Y-Radius,Size,Size,ValuePercent);
+	
+	ValuePercent = max(0,ValuePercent); // in case of right-click, return to position 0
+	Value=floor(ValuePercent*(Steps-1)/100 +0.49); // Round it
+
+	// Draw the ticks around the circle
+	PR.UseColor(PR.Color.Text);
+	
+	(Steps <=5 ) ? (
+		MinAngle=30;
+		TickAngleStep = 120/(Steps-1);
+	):(
+		MinAngle=-30;
+		TickAngleStep = 240/(Steps-1);
+	);
+	TickNumber = 0;
+	loop(Steps,
+		TickAngle = (MinAngle+TickNumber*TickAngleStep)*2*$pi/360; // scaled to an angle in rad
+		gfx_line(X+1.2*Radius*sin(TickAngle), Y-1.2*Radius*cos(TickAngle), X,Y); // Draw the tick
+		TickNumber +=1;
+	);
+	// Draw it
+
+	KnobAngle=(MinAngle+(Value)*TickAngleStep)*2*$pi/360; // scaled to an angle in rad
+
+	// Shadow around the contour of the knob
+	PR.UseColor(PR.Color.Shadow);
+	gfx_circle(X+Radius/30,Y+Radius/20,Radius*1.0,1,1);
+	(PictureNumber == -1) ? (
+		XAngle=X+sin(KnobAngle)*Radius;
+		YAngle=Y-cos(KnobAngle)*Radius; // minus means center on top
+		// Contour
+		PR.UseColor(PR.Color.Contour);
+		gfx_circle(X,Y,Radius,1,1);
+		// Pointer
+		PR.UseColor(PR.Color.Text);	
+		gfx_line(X,Y,XAngle,YAngle,1);
+		// Shadow on the knob
+		PR.UseColor(PR.Color.Shadow);
+		gfx_circle(X+Radius/10,Y+Radius/8,(Radius-ContourSize)*1.0,1,1);
+		// Knob
+		PR.UseColor(PR.Color.Main);
+		gfx_circle(X,Y,Radius-ContourSize,1,1);
+	):(
+		gfx_x = X-Radius;
+		gfx_y = Y-Radius;
+		gfx_a = 1;
+		gfx_getimgdim(PictureNumber,PictureWidth,PictureHeight);
+		Ratio=SPercent*ScalingFactor/PictureWidth;
+		gfx_blit(PictureNumber,Ratio,KnobAngle);// KnobAngle
+	);
+	PR.SetSlider(SliderNumber, Value);
+	Value;
+);
+function PR.DisplayRotarySwitch(SliderNumber Steps XPercent YPercent SPercent) (
+	PR.DisplayRotarySwitch(SliderNumber,Steps,-1,XPercent,YPercent,SPercent);
+);
+
+function PR.DisplayRotarySwitch(SliderNumber Steps PictureNumber) (
+	PR.DisplayRotarySwitch(
+		SliderNumber,Steps,PictureNumber,PR.Memory.Start[0],PR.Memory.Start[1],PR.Memory.Start[3]);
+);
+
+function PR.DisplayRotarySwitch(SliderNumber Steps) ( // No Picture
+	PR.DisplayRotarySwitch(SliderNumber,Steps,-1,PR.Memory.Start[0],PR.Memory.Start[1],PR.Memory.Start[3]);
+);
+
+/****************************************************************************************
+					Processing setup functions, to be used by your plugins
+****************************************************************************************/
+
+function PR.SetMonoPeakingEQ(MonoEQ,F,G,Q) local(omega alpha A norm) (
+	// EQ is a pointer to quasi-object. Use the appropriate new function
+	A = PR.dBToLinear(max(-24, min(G,24)));	
+	omega = 2*$pi*max(20, min(F,20000))/srate;
+	alpha = sin(omega)/(2*max(0.1, min(Q,10)));
+
+	// EQ[4] // a1		EQ[5] // a2
+	// EQ[6] // b0		EQ[7] // b1		EQ[8] // b2		
+	(MonoEQ[15]=="MonoEQ") ? (
+		norm = 1+alpha/A;
+		MonoEQ[6] = (1+alpha*A)/norm;
+		MonoEQ[7] = -2*cos(omega)/norm;
+		MonoEQ[8] = (1-alpha*A)/norm;
+		MonoEQ[4] = -2*cos(omega)/norm;
+		MonoEQ[5] = (1-alpha/A)/norm;
+	):(PR.Debug = "Error:SetMonoPeakingEQ";);
+);
+
+function PR.SetStereoPeakingEQ(StereoEQ,Frequency,Gain,Q) local(omega alpha A norm) (
+	/* EQ is a pointer to quasi-object. Use the appropriate new function
+	Pointer values are:
+		0,1: y1, is also the output!
+		2,3: y2
+		4,5: x0
+		6,7: x1
+		8,9: x2
+		10,11: a1,a2 (equations are normalized to a0=1)
+		12,13,14: b0, b1, b2  */
+	(StereoEQ[15]=="StereoEQ") ? (
+		A = PR.dBToLinear(max(-24, min(Gain,24)));	
+		omega = 2*$pi*max(20, min(Frequency,20000))/srate;
+		alpha = sin(omega)/(2*max(0.1, min(Q,10)));
+		norm = 1+alpha/A;
+		StereoEQ[12] = (1+alpha*A)/norm; // b0
+		StereoEQ[13] = -2*cos(omega)/norm; // b1
+		StereoEQ[14] = (1-alpha*A)/norm; // b2
+		StereoEQ[10] = -2*cos(omega)/norm; // a1
+		StereoEQ[11] = (1-alpha/A)/norm; // a2
+	):(PR.Debug = "Error:SetStereoPeakingEQ";);
+);
+
+function PR.SetMonoLowPassEQ(MonoEQ,F,G,Q) local(omega alpha A) (
+	// EQ is a pointer to quasi-object. Use the appropriate new function
+	(MonoEQ[15]=="MonoEQ") ? (	
+		A = PR.dBToLinear(max(-24, min(Gain,24)));	
+		omega = 2*$pi*max(20, min(F,20000))/srate;
+		alpha = sin(omega)/(2*max(0.1, min(Q,10)));
+		MonoEQ[6] = (1-cos(omega))/2/(1+alpha); // b0
+		MonoEQ[7] = (1-cos(omega))/(1+alpha); // b1
+		MonoEQ[8] = (1-cos(omega))/2/(1+alpha); // b2
+		MonoEQ[4] = -2*cos(omega)/(1+alpha); // a1
+		MonoEQ[5] = (1-alpha)/(1+alpha); //a2
+	):(PR.Debug = "Error:SetMonoLowPassEQ";);
+);
+
+function PR.SetStereoLowPassEQ(StereoEQ,F,G,Q) local(omega alpha A) (
+	// EQ is a pointer to quasi-object. Use the appropriate new function
+	(StereoEQ[15]=="StereoEQ") ? (
+		A = PR.dBToLinear(max(-24, min(Gain,24)));	
+		omega = 2*$pi*max(20, min(F,20000))/srate;
+		alpha = sin(omega)/(2*max(0.1, min(Q,10)));
+		StereoEQ[12] = (1-cos(omega))/2/(1+alpha); // b0
+		StereoEQ[13] = (1-cos(omega))/(1+alpha); // b1
+		StereoEQ[14] = (1-cos(omega))/2/(1+alpha); // b2
+		StereoEQ[10] = -2*cos(omega)/(1+alpha); // a1
+		StereoEQ[11] = (1-alpha)/(1+alpha); // a2
+	):(PR.Debug = "SetStereoLowPassEQ");
+);
+
+function PR.SetMonoHighPassEQ(MonoEQ,F,G,Q) local(omega alpha A) (
+	// EQ is a pointer to quasi-object. Use the appropriate new function
+	(MonoEQ[15]=="MonoEQ") ? (
+		A = PR.dBToLinear(max(-24, min(Gain,24)));	
+		omega = 2*$pi*max(20, min(F,20000))/srate;
+		alpha = sin(omega)/(2*max(0.1, min(Q,10)));		
+		MonoEQ[6] = (1+cos(omega))/2/(1+alpha); // b0
+		MonoEQ[7] = -(1+cos(omega))/(1+alpha); // b1
+		MonoEQ[8] = (1+cos(omega))/2/(1+alpha); // b2
+		MonoEQ[4] = -2*cos(omega)/(1+alpha); // a1
+		MonoEQ[5] = (1-alpha)/(1+alpha); // a2
+	):(PR.Debug = "Error:SetMonoHighPassEQ");	
+);
+
+function PR.SetStereoHighPassEQ(StereoEQ,F,G,Q) local(omega alpha A) (
+	// EQ is a pointer to quasi-object. Use the appropriate new function
+	(StereoEQ[15]=="StereoEQ") ? (
+		A = PR.dBToLinear(max(-24, min(Gain,24)));	
+		omega = 2*$pi*max(20, min(F,20000))/srate;
+		alpha = sin(omega)/(2*max(0.1, min(Q,10)));
+		StereoEQ[12] = (1+cos(omega))/2/(1+alpha); // b0
+		StereoEQ[13] = -(1+cos(omega))/(1+alpha); // b1
+		StereoEQ[14] = (1+cos(omega))/2/(1+alpha); // b2
+		StereoEQ[10] = -2*cos(omega)/(1+alpha); // a1
+		StereoEQ[11] = (1-alpha)/(1+alpha); // a2
+	):(PR.Debug = "Error:SetStereoHighPassEQ");
+);
+
+function PR.SetMonoBandpassEQ(MonoEQ,F,G,Q) local(omega alpha A) (
+	// EQ is a pointer to quasi-object. Use the appropriate new function
+	(MonoEQ[15]=="MonoEQ") ? (
+		A = PR.dBToLinear(max(-24, min(Gain,24)));	
+		omega = 2*$pi*max(20, min(F,20000))/srate;
+		alpha = sin(omega)/(2*max(0.1, min(Q,10)));		
+		MonoEQ[6] = alpha/(1+alpha); // b0
+		MonoEQ[7] = 0; // b1
+		MonoEQ[8] = -alpha/(1+alpha); // b2
+		MonoEQ[4] = -2*cos(omega)/(1+alpha); // a1
+		MonoEQ[5] = (1-alpha)/(1+alpha); // a2
+	):(PR.Debug = "Error:SetMonoBandpassEQ");	
+);
+
+function PR.SetStereoBandpassEQ(StereoEQ,F,G,Q) local(omega alpha A) (
+	// EQ is a pointer to quasi-object. Use the appropriate new function
+	(StereoEQ[15]=="StereoEQ") ? (
+		A = PR.dBToLinear(max(-24, min(Gain,24)));	
+		omega = 2*$pi*max(20, min(F,20000))/srate;
+		alpha = sin(omega)/(2*max(0.1, min(Q,10)));		
+		StereoEQ[12] = alpha/(1+alpha); // b0
+		StereoEQ[13] = 0; // b1
+		StereoEQ[14] = -alpha/(1+alpha); // b2
+		StereoEQ[10] = -2*cos(omega)/(1+alpha); // a1
+		StereoEQ[11] = (1-alpha)/(1+alpha); // a2
+	):(PR.Debug = "Error:SetStereoBandpassEQ");
+);
+
+function PR.SetMonoNotchEQ(MonoEQ,F,G,Q) local(omega alpha A) (
+	// EQ is a pointer to quasi-object. Use the appropriate new function
+	(MonoEQ[15]=="MonoEQ") ? (
+		A = PR.dBToLinear(max(-24, min(Gain,24)));	
+		omega = 2*$pi*max(20, min(F,20000))/srate;
+		alpha = sin(omega)/(2*max(0.1, min(Q,10)));		
+		MonoEQ[6] = 1/(1+alpha); // b0
+		MonoEQ[7] = -2*cos(omega)/(1+alpha); // b1
+		MonoEQ[8] = 1/(1+alpha); // b2
+		MonoEQ[4] = -2*cos(omega)/(1+alpha); // a1
+		MonoEQ[5] = (1-alpha)/(1+alpha); // a2
+	):(PR.Debug = "Error:MonoNotchEQ");	
+);
+
+function PR.SetStereoNotchEQ(StereoEQ,F,G,Q) local(omega alpha A) (
+	// EQ is a pointer to quasi-object. Use the appropriate new function
+	(StereoEQ[15]=="StereoEQ") ? (
+		A = PR.dBToLinear(max(-24, min(Gain,24)));	
+		omega = 2*$pi*max(20, min(F,20000))/srate;
+		alpha = sin(omega)/(2*max(0.1, min(Q,10)));		
+		StereoEQ[12] = 1/(1+alpha); // b0
+		StereoEQ[13] = -2*cos(omega)/(1+alpha); // b1
+		StereoEQ[14] = 1/(1+alpha); // b2
+		StereoEQ[10] = -2*cos(omega)/(1+alpha); // a1
+		StereoEQ[11] = (1-alpha)/(1+alpha); // a2
+	):(PR.Debug = "Error:StereoNotchEQ");
+);
+
+function PR.SetMonoLowShelfEQ(MonoEQ,F,G,Q) local(omega alpha A norm) (
+	// EQ is a pointer to quasi-object. Use the appropriate new function
+	(MonoEQ[15]=="MonoEQ") ? (	
+		A = PR.dBToLinear(max(-24, min(Gain,24)));	
+		omega = 2*$pi*max(20, min(F,20000))/srate;
+		alpha = sin(omega)/(2*max(0.1, min(Q,10)));		
+		norm = (A+1)+(A-1)*cos(omega)+2*sqrt(A)*alpha;
+		MonoEQ[6] = A*((A+1)-(A-1)*cos(omega)+2*sqrt(A)*alpha)/norm; // b0
+		MonoEQ[7] = 2*A*((A-1)-(A+1)*cos(omega))/norm; // b1
+		MonoEQ[8] = A*((A+1)-(A-1)*cos(omega)-2*sqrt(A)*alpha)/norm; // b2
+		MonoEQ[4] = -2*((A-1)+(A+1)*cos(omega))/norm; // a1
+		MonoEQ[5] = ((A+1)+(A-1)*cos(omega)-2*sqrt(A)*alpha)/norm; // a2
+	):(PR.Debug = "Error:SetMonoLowShelfEQ");
+);
+
+function PR.SetStereoLowShelfEQ(StereoEQ,F,G,Q) local(omega alpha A norm) (
+	// EQ is a pointer to quasi-object. Use the appropriate new function
+	(StereoEQ[15]=="StereoEQ") ? (
+		A = PR.dBToLinear(max(-24, min(Gain,24)));	
+		omega = 2*$pi*max(20, min(F,20000))/srate;
+		alpha = sin(omega)/(2*max(0.1, min(Q,10)));		
+		norm = (A+1)+(A-1)*cos(omega)+2*sqrt(A)*alpha;
+		StereoEQ[12] = A*((A+1)-(A-1)*cos(omega)+2*sqrt(A)*alpha)/norm; // b0
+		StereoEQ[13] = 2*A*((A-1)-(A+1)*cos(omega))/norm; // b1
+		StereoEQ[14] = A*((A+1)-(A-1)*cos(omega)-2*sqrt(A)*alpha)/norm; // b2
+		StereoEQ[10] = -2*((A-1)+(A+1)*cos(omega))/norm; // a1
+		StereoEQ[11] = ((A+1)+(A-1)*cos(omega)-2*sqrt(A)*alpha)/norm; // a2
+	):(PR.Debug = "Error:SetStereoLowShelfEQ");
+);
+
+function PR.SetMonoHighShelfEQ(MonoEQ,F,G,Q) local(omega alpha A norm) (
+	// EQ is a pointer to quasi-object. Use the appropriate new function
+	(MonoEQ[15]=="MonoEQ") ? (
+		A = PR.dBToLinear(max(-24, min(Gain,24)));	
+		omega = 2*$pi*max(20, min(F,20000))/srate;
+		alpha = sin(omega)/(2*max(0.1, min(Q,10)));
+		norm = (A+1)-(A-1)*cos(omega)+2*sqrt(A)*alpha;
+		MonoEQ[6] = A*((A+1)+(A-1)*cos(omega)+2*sqrt(A)*alpha)/norm; // b0
+		MonoEQ[7] = -2*A*((A-1)+(A+1)*cos(omega))/norm; // b1
+		MonoEQ[8] = A*((A+1)+(A-1)*cos(omega)-2*sqrt(A)*alpha)/norm; // b2
+		MonoEQ[4] = 2*((A-1)-(A+1)*cos(omega))/norm; // a1
+		MonoEQ[5] = ((A+1)-(A-1)*cos(omega)-2*sqrt(A)*alpha)/norm; // a2
+	):(PR.Debug = "Error:SetMonoHighShelfEQ");	
+);
+
+function PR.SetStereoHighShelfEQ(StereoEQ,F,G,Q) local(omega alpha A norm) (
+	// EQ is a pointer to quasi-object. Use the appropriate new function
+	(StereoEQ[15]=="StereoEQ") ? (
+		A = PR.dBToLinear(max(-24, min(Gain,24)));	
+		omega = 2*$pi*max(20, min(F,20000))/srate;
+		alpha = sin(omega)/(2*max(0.1, min(Q,10)));
+		norm = (A+1)-(A-1)*cos(omega)+2*sqrt(A)*alpha;
+		StereoEQ[12] = A*((A+1)+(A-1)*cos(omega)+2*sqrt(A)*alpha)/norm; // b0
+		StereoEQ[13] = -2*A*((A-1)+(A+1)*cos(omega))/norm; // b1
+		StereoEQ[14] = 	A*((A+1)+(A-1)*cos(omega)-2*sqrt(A)*alpha)/norm; // b2
+		StereoEQ[10] = 2*((A-1)-(A+1)*cos(omega))/norm; // a1
+		StereoEQ[11] = ((A+1)-(A-1)*cos(omega)-2*sqrt(A)*alpha)/norm; // a2
+	):(PR.Debug = "SetStereoHighShelfEQ");
+);
+
+
+function PR.SetMonoEnvelopeFollower(MonoEF AttackTime ReleaseTime) (
+	// MonoEF is a pointer to quasi-object. Use the appropriate new function
+	(MonoEF[15]=="MonoEnvelopeFollower") ? (
+		MonoEF[1]=exp(-1/(AttackTime*srate));// AttackCoefficient
+		MonoEF[2]=exp(-1/(ReleaseTime*srate));// ReleaseCoefficient
+	):(PR.Debug = "Error:SetMonoEnvelopeFollower");	
+);
+
+function PR.SetStereoEnvelopeFollower(StereoEF AttackTime ReleaseTime) (
+	// StereoEF is a pointer to quasi-object. Use the appropriate new function
+	(StereoEF[15]=="StereoEnvelopeFollower") ? (			
+		StereoEF[2]=exp(-1/(AttackTime*srate));// AttackCoefficient
+		StereoEF[3]=exp(-1/(ReleaseTime*srate));// ReleaseCoefficient
+	):(PR.Debug = "Error:SetStereoEnvelopeFollower");
+);
+
+function PR.SetMonoDelay(MonoDelay Timems Feedback) local(CircularBufferSize)(
+	/* MonoDelay is a pointer to quasi-object. Use the appropriate new function.
+		0: maximum length in samples
+		1: length of circular buffer (buffer goes from 4 to 4+length)
+		2: feedback
+		3: Pointer to the actual value in the buffer from 4 to 4+length
+		4...maximumlength+4: Past samples */
+	(MonoDelay[15]=="MonoDelay") ? (
+		Timems= floor(max(Timems,2000/srate)); // At least 2 samples;
+		// Time can't be longer than max:
+		CircularBufferSize=min(MonoDelay[0],floor(Timems*srate/1000));
+		// If the new delay is longer, fill memory with zeros to avoid hearing old samples using memset(dest,value,length):
+		(CircularBufferSize>MonoDelay[1]) ? (
+			memset(MonoDelay+4,0,CircularBufferSize-4);
+		);
+		MonoDelay[1]=CircularBufferSize;
+		MonoDelay[2]=Feedback/100;
+	):(PR.Debug = "Error:SetMonoDelay");
+);
+
+function PR.SetStereoDelay(StereoDelay Timems Feedback) local(CircularBufferSize)(
+	/* StereoDelay is a pointer to quasi-object. Use the appropriate new function.
+		0: Output Left
+		1: Output Right
+		2: Maximum length, per channel
+		3: Buffer length, per channel
+		4: feedback
+		5: Pointer to the actual value in the left buffer (right buffer position will be calculated)
+		6...2*maximumlength+6: Past samples
+		Note: Maybe I could also use the "tempo", with ts_num and ts_denum (tempo signature) system variable value?
+	*/
+	(StereoDelay[15]=="StereoDelay") ? (
+		Timems= floor(max(Timems,2000/srate)); // At least 2 samples;
+		// Time can't be longer than max:
+		CircularBufferSize=min(StereoDelay[2],floor(Timems*srate/1000));
+		// If the new delay is longer, fill memory with zeros to avoid hearing old samples using memset(dest,value,length):
+	//	(CircularBufferSize>StereoDelay[3])?(
+	//		memset(StereoDelay+6,0,2*StereoDelay[2]-6);
+	//	);
+		StereoDelay[3]=CircularBufferSize;
+		StereoDelay[4]=Feedback/100;
+	):(PR.Debug = "Error:SetStereoDelay");
+);
+
+
+/***************************************************************************************
+								Signal Processing Functions
+***************************************************************************************/
+
+function PR.MonoEQ(EQ input) local(output)(
+	// EQ is a pointer to quasi-object. Use the appropriate new and set functions
+	/* Stereo parametric EQ, output left = EQ[0] and right =EQ[1]
+	Pointer values are:
+		EQ[0] // y1		EQ[1] // y2		
+		EQ[2] // x1		EQ[3] // x2	
+		EQ[4] // a1		EQ[5] // a2	
+		EQ[6] // b0		EQ[7] // b1		EQ[8] // b2	
+		process:	out = b0*in +b1*x1+ b2*x2-a1*y1 -a2*y2;
+	*/
+	(EQ[15]=="MonoEQ") ? (
+		output = EQ[6]*input+EQ[7]*EQ[2]+EQ[8]*EQ[3]-EQ[4]*EQ[0]-EQ[5]*EQ[1];
+		// time slip
+		EQ[3]=EQ[2];	EQ[2]=input;	EQ[1]=EQ[0];	EQ[0]=output; // return value
+	):(PR.Debug = "Error:MonoEQ");
+);
+
+
+function PR.StereoEQ(EQ inputL inputR) local(outputL OutputR)(
+	// EQ is a pointer to quasi-object. Use the appropriate new and set functions
+	/* Stereo parametric EQ, output left = EQ[0] and right =EQ[1]
+	Pointer values are:
+		0,1: y1, is also the output!
+		2,3: y2
+		4,5: x0
+		6,7: x1
+		8,9: x2
+		10,11: a1,a2 (equations are normalized to a0=1)
+		12,13,14: b0, b1, b2
+	process: out = b0*in +b1*x1+ b2*x2-a1*y1 -a2*y2;
+	*/
+	(EQ[15]=="StereoEQ") ? (
+		outputL = EQ[12]*inputL +EQ[13]*EQ[6] +EQ[14]*EQ[8] -EQ[10]*EQ[0] -EQ[11]*EQ[2];
+		OutputR = EQ[12]*inputR +EQ[13]*EQ[7] +EQ[14]*EQ[9] -EQ[10]*EQ[1] -EQ[11]*EQ[3];
+		// time slip: x2=x1; x1=input; y2=y1; y1=output;
+		EQ[8]=EQ[6];	EQ[9]=EQ[7];
+		EQ[6]=InputL;	EQ[7]=InputR;	
+		EQ[2]=EQ[0];	EQ[3]=EQ[1];
+		EQ[0]=OutputL;	EQ[1]=OutputR;
+	):(PR.Debug = "Error:StereoEQ");
+);
+
+
+function PR.MonoClip(MAXdB input ) (sign(input)*min(abs(input),PR.dBToLinear(MAXdB)););
+
+function PR.MonoEnvelopeFollower(EF input) local (output)(
+	// Returns the output.  EF is a pointer to quasi-object. Use the appropriate new and set functions.  Contains: 0:Last value, 1:AttackConstant, 2:ReleaseConstant
+	(EF[15]=="MonoEnvelopeFollower") ? (
+		(input > EF[0]) ? (
+			// output[i] = attack_alpha*output[i-1]+(1-attack_alpha)*input_signal[i]
+			EF[0]=EF[1]*EF[0]+(1-EF[1])*input;
+		):(
+			// output[i] = release_alpha*output[i-1]+(1-release_alpha)*input_signal[i]
+			EF[0]=EF[2]*EF[0]+(1-EF[2])*input;
+		);
+	):(PR.Debug = "Error:MonoEnvelopeFollower");
+	EF[0];
+);
+
+function PR.MonoDelay(MonoDelay Input) local(Nowptr Thenptr)(
+	/* Returns the output.  Delay is a pointer to quasi-object. Use the appropriate new and set functions.  Output clips at +12dB
+		0: maximum length in samples
+		1: length of circular buffer (buffer goes from 16 to 16+length)
+		2: feedback
+		3: Pointer to the actual value in the buffer from 16 to 16+length
+		16...maximumlength+16: Past samples
+	*/
+
+	// Increment circular buffer pointer
+	(MonoDelay[15]=="MonoDelay") ? (
+		Nowptr=MonoDelay[3];
+		(MonoDelay[3]>=MonoDelay[1]+15)? (Thenptr=16;):(Thenptr=Nowptr+1;);	
+		
+		MonoDelay[3] = Thenptr;  // Should be combined in the ? above
+		MonoDelay[Nowptr]
+			= PR.MonoClip(12,Input+MonoDelay[2]*MonoDelay[Thenptr]);
+	):(PR.Debug = "Error:MonoDelay");
+	MonoDelay[Thenptr];
+);
+
+
+function PR.StereoDelay(StereoDelay InputLeft InputRight) local(Nowptr Thenptr)(
+	/* StereoDelay is a pointer to quasi-object. Use the appropriate new function.
+		0: Output Left, clips at +12dB
+		1: Output Right, clips at +12dB
+		2: Maximum length in samples as allocated by the new function, per channel
+		3: length in samples, per channel
+		4: feedback
+		5: Pointer to the actual value in the buffer from 16 to 16+length (right channel ptr deducted)
+		16...2*maximumlength+16: Past samples
+	*/
+
+	// Increment circular buffer pointer
+	(StereoDelay[15]=="StereoDelay") ? (
+		Thenptr=Nowptr=StereoDelay[5]; // from 16 to 16+length
+		(Thenptr>=StereoDelay[3]+16)? (StereoDelay[5]=Thenptr=16;):(StereoDelay[5]=Thenptr+=1;);	
+
+		StereoDelay[0] = StereoDelay[Thenptr];
+		StereoDelay[1] = StereoDelay[Thenptr+StereoDelay[2]];
+
+		StereoDelay[Nowptr] = PR.MonoClip(12,InputLeft+StereoDelay[4]*StereoDelay[Thenptr]);
+		StereoDelay[Nowptr+StereoDelay[2]]
+			= PR.MonoClip(12,InputRight+StereoDelay[4]*StereoDelay[Thenptr+StereoDelay[2]]);
+	):(PR.Debug = "Error:StereoDelay");
+);
