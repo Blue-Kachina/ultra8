@@ -14,16 +14,28 @@ desc:Ultra8 Looper
 //   - right click to cycle note/CC/PC/off
 //   - ctrl/cmd+right click to assign to the last MIDI event received
 //
-// for each channel:
+// for each channel (lane-local mode):
 //   - note1=if not recording, start record
 //           if already recording (and initial length-setting pass), set length and continue (overdub)
 //           if already recording (and length is set), go back to playback
 //   - note2=toggle playback (stop/rec->play, play->stop)
 //   - note3=toggle selected-for-monitoring
 //   - note4=reverse loop
-// Right click the channel's monitoring icon to go through off/auto/always-on. 
+// Right click the channel's monitoring icon to go through off/auto/always-on.
 //   - I use 'off' for things like mic'd drums
 //   - I use 'always-on' for stuff where the source should always be audible (usually looping is less important)
+//
+// common mode (one MIDI channel per lane, via st_midichan):
+//   - Common REC/PLY: toggle the addressed lane/pair between recording and playing.
+//       Recording → play mode; anything else → recording.
+//       Pair-aware: acts on pair owner and affects both lanes when linked.
+//   - Common PLY/STP: toggle the addressed lane/pair between playing and stopped.
+//       Playing → stopped; stopped → playing (no-op on empty lane); recording → playing.
+//       Pair-aware: acts on pair owner and affects both lanes when linked.
+//   - Common MON: toggle the addressed lane/pair between monitoring disabled and always-monitor.
+//       Skips the intermediate auto/selected-monitor mode (MIDI only; right-click still cycles all three).
+//       Pair-aware: mirrors monitor state to linked partner lane.
+// Note: common-mode actions are immediate (not latched), independent of lane-local note1/note2 logic.
 
 // extra buttons:
 // - halve length
@@ -275,6 +287,23 @@ function pair_partner_rec(idx) local(p) (
   p = pair_partner_idx(idx);
   p >= 0 ? mem_stlist + p * st_num : -1;
 );
+
+// Returns non-zero if either lane of the pair has recorded content (st_dirty > 0).
+// Checks both owner and partner so PLY/STP guards correctly on linked pairs.
+function pair_has_content(idx) local(oidx pidx orec prec has) (
+  oidx = pair_owner_idx(idx);
+  pidx = pair_partner_idx(oidx);
+  orec = mem_stlist + oidx * st_num;
+
+  has = orec[st_dirty] > 0;
+
+  pidx >= 0 ? (
+    prec = mem_stlist + pidx * st_num;
+    has |= prec[st_dirty] > 0;
+  );
+
+  has;
+);
 // ─────────────────────────────────────────────────────────────────────────────
 
 function setstate_for_rec(rec, state) (
@@ -314,6 +343,44 @@ function snapshot_pair(idx) local(oidx pidx orec prec) (
 function select_pair(idx) (
   g_chan_selected = pair_owner_idx(idx);
 );
+
+// ── Common-mode action helpers ────────────────────────────────────────────────
+// REC/PLY: recording→play; stopped/empty→record; playing→record/overdub.
+// Saves a pre-overdub undo snapshot when entering record from an existing loop.
+function common_recply_pair(idx) local(oidx orec newstate) (
+  oidx = pair_owner_idx(idx);
+  orec = mem_stlist + oidx * st_num;
+
+  newstate = orec[st_state] == 2 ? 1 : 2;
+
+  newstate == 2 ? snapshot_pair(oidx);
+  setstate_pair(oidx, newstate);
+  select_pair(oidx);
+);
+
+// PLY/STP: recording→play; playing→stop; stopped+content→play; empty→no-op.
+// Uses pair_has_content so the empty-lane guard covers both lanes of a linked pair.
+function common_plystp_pair(idx) local(oidx orec newstate) (
+  oidx = pair_owner_idx(idx);
+  orec = mem_stlist + oidx * st_num;
+
+  orec[st_state] == 2 ? (
+    // Recording → commit and enter playback.
+    newstate = 1;
+  ) : orec[st_state] == 1 ? (
+    // Playing → stop.
+    newstate = 0;
+  ) : (
+    // Stopped → play only when the pair has recorded content; otherwise no-op.
+    newstate = pair_has_content(oidx) ? 1 : 0;
+  );
+
+  newstate != orec[st_state] ? (
+    setstate_pair(oidx, newstate);
+    select_pair(oidx);
+  );
+);
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 function play_or_stop_all() local(want_state rec i)
@@ -599,6 +666,28 @@ function undo_pair(idx) local(oidx pidx orec prec) (
   updatechfromrec();
 );
 
+// MON: two-state toggle — disabled (0) ↔ always-monitor (2).
+// Auto/selected (1) is treated as "not always" — next press promotes it to always.
+// Mirrors the new mode to the linked partner lane when applicable.
+// Defined here (after updatechfromrec) to avoid a forward-reference error.
+function common_mon_pair(idx) local(oidx pidx orec prec newmode) (
+  oidx = pair_owner_idx(idx);
+  pidx = pair_partner_idx(oidx);
+  orec = mem_stlist + oidx * st_num;
+
+  newmode = orec[st_monmode] == 2 ? 0 : 2;
+
+  orec[st_monmode] = newmode;
+
+  pidx >= 0 ? (
+    prec = mem_stlist + pidx * st_num;
+    prec[st_monmode] = newmode;
+  );
+
+  updatechfromrec();
+  g_mon_changed = 1;
+);
+
 function reset() local(lp)
 ( 
   g_chan_selected=-1;
@@ -697,6 +786,15 @@ ext_noinit == 0 ? (
   g_common = 1;       // common mode: on by default (synced from mem_gen_cfg[21] after serialize)
   g_mon_changed = 0;  // flag: monmode changed in @sample, sliderchange needed from @gfx
   g_msg_chan = 1;     // last received MIDI channel (1-16)
+
+  // Debug telemetry — updated in @sample on every common-mode dispatch, read in @gfx.
+  g_dbg_cmn_name  = "";   // name of last common action ("REC/PLY", "PLY/STP", "MON", …)
+  g_dbg_cmn_ch    = 0;    // MIDI channel it arrived on
+  g_dbg_cmn_idx   = 0;    // lane index it matched (before pair resolution)
+  g_dbg_cmn_state0 = -1;  // owner state/monmode BEFORE the action
+  g_dbg_cmn_state1 = -1;  // owner state/monmode AFTER the action
+  g_dbg_cmn_dirty0 = 0;   // owner dirty BEFORE
+  g_dbg_cmn_dirty1 = 0;   // owner dirty AFTER
 
   g_inactive_blockcnt=0;  
   g_active_mask = 0; 
@@ -958,43 +1056,67 @@ while (sidx == nextmsg_offs)
   // Common mode: resolve global assignments to per-lane inject form BEFORE latch check,
   // so the latch queue stores resolved values (correct lane, not the global note).
   (nextmsg_1 & 0xF0) == 0x90 && nextmsg_3 != 0 && g_common ? (
+    // Capture for MIDI display BEFORE suppression — common msgs set nextmsg_3=0
+    // which prevents the normal g_lastmsg update below, making MIDI look absent in UI.
+    nextmsg_2 < 1024 ? g_lastmsg = nextmsg_2;
+
     g_cmn_i = 0;
     loop(g_nchan,
-      mem_stlist[g_cmn_i*st_num + st_midichan] == g_msg_chan ? (
+      // Guard: skip if nextmsg_3 was already suppressed (0) by a prior lane match.
+      // Without this, two lanes sharing the same st_midichan would double-fire —
+      // e.g. common_recply_pair called twice reverses itself (0→2→1 = green, not red).
+      mem_stlist[g_cmn_i*st_num + st_midichan] == g_msg_chan && nextmsg_3 ? (
         g_cmn_rec = mem_stlist + g_cmn_i*st_num;
         nextmsg_2 == cfgp_common_rec[] ? (
-          // Snapshot before overdub (pair-aware: saves both lanes when linked)
-          snapshot_pair(g_cmn_i);
-          // Redirect note to pair owner so REC always hits the owner lane
-          nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note1;
-          common_dispatch = 1; // translated: allow lane dispatch
+          // REC/PLY: recording→play; stopped/playing→record/overdub.
+          g_dbg_cmn_state0 = g_cmn_rec[st_state];
+          g_dbg_cmn_dirty0 = g_cmn_rec[st_dirty];
+          common_recply_pair(g_cmn_i);
+          g_dbg_cmn_state1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_state];
+          g_dbg_cmn_dirty1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_dirty];
+          strcpy(g_dbg_cmn_name, "REC/PLY");
+          g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
+          nextmsg_3 = 0; // suppress further dispatch
         ) :
         nextmsg_2 == cfgp_common_clr[] ? (
           // Clear lane(s): pair-aware — stops, zeros buffer, drops undo snapshot
+          strcpy(g_dbg_cmn_name, "CLR");
+          g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
           clear_pair(g_cmn_i);
           nextmsg_3 = 0; // suppress further dispatch
         ) :
         nextmsg_2 == cfgp_common_ply[] ? (
-          nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note2;
-          common_dispatch = 1; // translated: allow lane dispatch
+          // PLY/STP: recording→play; playing→stop; stopped+content→play; empty→no-op.
+          g_dbg_cmn_state0 = g_cmn_rec[st_state];
+          g_dbg_cmn_dirty0 = g_cmn_rec[st_dirty];
+          common_plystp_pair(g_cmn_i);
+          g_dbg_cmn_state1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_state];
+          g_dbg_cmn_dirty1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_dirty];
+          strcpy(g_dbg_cmn_name, "PLY/STP");
+          g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
+          nextmsg_3 = 0; // suppress further dispatch
         ) :
         nextmsg_2 == cfgp_common_undo[] ? (
           // Undo: pair-aware — restores both lanes when linked
+          strcpy(g_dbg_cmn_name, "UNDO");
+          g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
           undo_pair(g_cmn_i);
           nextmsg_3 = 0; // suppress further dispatch
         ) :
         nextmsg_2 == cfgp_common_sel[] ? (
+          strcpy(g_dbg_cmn_name, "SEL");
+          g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
           nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note3;
           common_dispatch = 1; // translated: allow lane dispatch
         ) :
         nextmsg_2 == cfgp_common_mon[] ? (
-          // Mon: cycle immediately (not latched); suppress normal dispatch
-          g_cmn_rec[st_monmode] = (g_cmn_rec[st_monmode]+1)%3;
-          g_cmn_lnk = get_linked_rec(g_cmn_i);
-          g_cmn_lnk >= 0 ? g_cmn_lnk[st_monmode] = g_cmn_rec[st_monmode];
-          updatechfromrec();
-          g_mon_changed = 1; // @gfx will call sliderchange(-1)
-          nextmsg_3 = 0;    // suppress further dispatch
+          // MON: disabled↔always-monitor (auto/selected treated as not-always).
+          g_dbg_cmn_state0 = g_cmn_rec[st_monmode];
+          common_mon_pair(g_cmn_i);
+          g_dbg_cmn_state1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_monmode];
+          strcpy(g_dbg_cmn_name, "MON");
+          g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
+          nextmsg_3 = 0; // suppress further dispatch
         );
       );
       g_cmn_i += 1;
@@ -1440,15 +1562,44 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
 
     tx = ixpos + gap;
 
-    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_rec,  force_redraw, "REC")  + gap;
+    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_rec,  force_redraw, "REC/PLY")  + gap;
     tx += draw_value_tweaker(tx, ypos+6, cfgp_common_clr,  force_redraw, "CLR")  + gap;
     tx += 8;
-    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_ply,  force_redraw, "PLY")  + gap;
+    tx += draw_value_tweaker(tx, ypos+6, cfgp_common_ply,  force_redraw, "PLY/STP")  + gap;
     tx += draw_value_tweaker(tx, ypos+6, cfgp_common_undo, force_redraw, "UNDO") + gap;
     tx += 8;
     tx += draw_value_tweaker(tx, ypos+6, cfgp_common_sel,  force_redraw, "SEL")  + gap;
     tx += draw_value_tweaker(tx, ypos+6, cfgp_common_mon,  force_redraw, "MON")  + gap;
     ypos += 56;
+
+    // ── DEBUG TELEMETRY BAR ──────────────────────────────────────────────────
+    // Shows last common-mode action received: name, channel, lane, state change.
+    // Remove this block once behavior is confirmed correct.
+    g_dbg_cmn_ch > 0 ? (
+      gfx_set(0.05, 0.05, 0.12);
+      gfx_rect(ixpos, ypos, gfx_w - ixpos, 14);
+      gfx_setfont(1, "Arial", 10);
+      gfx_set(0.6, 0.9, 0.6);
+      gfx_x = ixpos + 4;
+      gfx_y = ypos + 2;
+      // For MON, state0/state1 hold monmode values, not loop state.
+      strcmp(g_dbg_cmn_name, "MON") == 0 ? (
+        gfx_printf("COMMON %s  ch=%d lane=%d  mon %d→%d",
+          g_dbg_cmn_name, g_dbg_cmn_ch, g_dbg_cmn_idx+1,
+          g_dbg_cmn_state0, g_dbg_cmn_state1);
+      ) : strcmp(g_dbg_cmn_name, "") != 0 ? (
+        gfx_printf("COMMON %s  ch=%d lane=%d  state %d→%d  dirty %d→%d  firstrec=%d",
+          g_dbg_cmn_name, g_dbg_cmn_ch, g_dbg_cmn_idx+1,
+          g_dbg_cmn_state0, g_dbg_cmn_state1,
+          g_dbg_cmn_dirty0, g_dbg_cmn_dirty1, g_firstrec);
+      ) : (
+        gfx_printf("COMMON  ch=%d lane=%d  %s",
+          g_dbg_cmn_ch, g_dbg_cmn_idx+1, g_dbg_cmn_name);
+      );
+      gfx_setfont(0);
+      ypos += 16;
+    );
+    // ────────────────────────────────────────────────────────────────────────
   );
 
   // Horizontal row-per-lane layout
@@ -1531,11 +1682,17 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       wantr = 1;
 
       // Lane container panel (full width minus link area, colored by state)
-      rec[st_state] == 2 ? PR.Color.Panel = "3A1A1AFF" :
-      rec[st_state] == 1 ? PR.Color.Panel = "1A3A1AFF" :
+      // State 2 = recording: vivid red so it's unmistakable vs stopped/playing.
+      // State 1 = playing:   visible green.
+      // Dirty   = stopped with content: dim blue-violet.
+      // Empty   = off: very dark.
+      rec[st_state] == 2 ? PR.Color.Panel = "6A1A1AFF" :
+      rec[st_state] == 1 ? PR.Color.Panel = "1A4A1AFF" :
       rec[st_dirty]      ? PR.Color.Panel = "2A2A40FF" :
                            PR.Color.Panel = "252530FF";
-      PR.Color.Contour = "5060A0FF";
+      rec[st_state] == 2 ? PR.Color.Contour = "C04040FF" :
+      rec[st_state] == 1 ? PR.Color.Contour = "40C040FF" :
+                           PR.Color.Contour = "5060A0FF";
       (mode&8) ? PR.Color.Contour = "8090E0FF";
       PR.DisplayPanel(
         (state_x + (content_right - state_x) * 0.5) / pr_s * 100,
@@ -1547,8 +1704,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       // State area fill: explicit raw rect painted after the PR panel so any
       // floating-point rounding in PR.DisplayPanel can't leave a gap at wave_x.
       // Covers from inside the left contour border (x+2) to exactly wave_x.
-      rec[st_state] == 2 ? gfx_set(0x3A/255.0, 0x1A/255.0, 0x1A/255.0) :
-      rec[st_state] == 1 ? gfx_set(0x1A/255.0, 0x3A/255.0, 0x1A/255.0) :
+      rec[st_state] == 2 ? gfx_set(0x6A/255.0, 0x1A/255.0, 0x1A/255.0) :
+      rec[st_state] == 1 ? gfx_set(0x1A/255.0, 0x4A/255.0, 0x1A/255.0) :
       rec[st_dirty]      ? gfx_set(0x2A/255.0, 0x2A/255.0, 0x40/255.0) :
                            gfx_set(0x25/255.0, 0x25/255.0, 0x30/255.0);
       gfx_rect(state_x + 2, row_y + 2, state_w - 2, lane_h - 4);
