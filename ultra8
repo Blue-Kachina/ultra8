@@ -754,7 +754,7 @@ ext_noinit == 0 ? (
   cfgp_common_mon  = mem_gen_cfg + 20;
   cfgp_common_clr  = mem_gen_cfg + 21;
   cfgp_common_undo = mem_gen_cfg + 22;
-  mem_gen_cfg[23]  = 1; // g_common: common mode on by default
+  mem_gen_cfg[23]  = 1; // g_show_globals: common mode on by default
   
   mem_gen_names = alloc(mem_gen_sz);
   memset(mem_gen_names,"",mem_gen_sz);
@@ -783,7 +783,7 @@ ext_noinit == 0 ? (
 
   g_inject_midinote = 0;
   g_ui_dispatch = 0;  // set to 1 when a UI-injected command is pre-loaded, so it bypasses the common-mode gate
-  g_common = 1;       // common mode: on by default (synced from mem_gen_cfg[21] after serialize)
+  g_show_globals = 1;       // common mode: on by default (synced from mem_gen_cfg[21] after serialize)
   g_mon_changed = 0;  // flag: monmode changed in @sample, sliderchange needed from @gfx
   g_msg_chan = 1;     // last received MIDI channel (1-16)
 
@@ -895,7 +895,7 @@ function doconf() local(i,s) (
     g_slider_sync = cfgp_sync[];
     g_latchmode = cfgp_latch[];
     g_slider_click_cnt = cfgp_clickcnt[]|0;
-    g_common = mem_gen_cfg[23]; // restore common mode toggle from saved state
+    g_show_globals = mem_gen_cfg[23]; // restore common mode toggle from saved state
     last_w=0;
   );
 );
@@ -1055,7 +1055,7 @@ while (sidx == nextmsg_offs)
 
   // Common mode: resolve global assignments to per-lane inject form BEFORE latch check,
   // so the latch queue stores resolved values (correct lane, not the global note).
-  (nextmsg_1 & 0xF0) == 0x90 && nextmsg_3 != 0 && g_common ? (
+  (nextmsg_1 & 0xF0) == 0x90 && nextmsg_3 != 0 && g_show_globals ? (
     // Capture for MIDI display BEFORE suppression — common msgs set nextmsg_3=0
     // which prevents the normal g_lastmsg update below, making MIDI look absent in UI.
     nextmsg_2 < 1024 ? g_lastmsg = nextmsg_2;
@@ -1126,9 +1126,9 @@ while (sidx == nextmsg_offs)
   (nextmsg_1 & 0xF0) == 0x90 && nextmsg_3 != 0  ? (
     // Lane dispatch is exclusive when common mode is on:
     // only translated common commands (common_dispatch=1) reach chan_onmsg / latch queue.
-    // Raw per-lane assignments are blocked while g_common is enabled (Option A).
+    // Raw per-lane assignments are blocked while g_show_globals is enabled (Option A).
     // Global controls (reset, halve, etc.) are checked below regardless of common mode.
-    (!g_common || common_dispatch || g_ui_dispatch) ? (
+    (!g_show_globals || common_dispatch || g_ui_dispatch) ? (
       (!g_latchmode || g_pos == 0 || g_firstrec) ? (
         chan_onmsg(nextmsg_1,nextmsg_2,nextmsg_3);
       ) : (
@@ -1513,7 +1513,7 @@ function load_file(filename, channel) local(fh nch sr len rec rec2 buf buf2 v i)
 
 function draw(ixpos, ypos) local(i gap rec mode force_redraw
   mx my mw t lx ty tw th rec2 wl
-  now dropfile lastcommon tx
+  now dropfile last_show_globals tx
   lane_h avail_lanes action_y action_h
   pr_s state_w peak_w wave_w sub_w mon_w
   state_x peak_x wave_x sub_x mon_x midi_x
@@ -1527,12 +1527,12 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   force_redraw = gfx_w != last_w || gfx_h != last_h ||
     lasthalve != cfgp_fade[] || lastlen != g_length ||
     lastoffs != g_offs || lastchanlink != cfgp_link[] ||
-    lastcommon != g_common;
+    last_show_globals != g_show_globals;
   lasthalve = cfgp_fade[];
   lastlen = g_length;
   lastoffs = g_offs;
   lastchanlink = cfgp_link[];
-  lastcommon = g_common;
+  last_show_globals = g_show_globals;
 
   gap = 4;
   now = time_precise();
@@ -1547,7 +1547,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   );
 
   // Common mode global strip
-  g_common ? (
+  g_show_globals ? (
     force_redraw ? (
       // Overall strip background
       PR.Color.Panel = "201A40FF";
@@ -1632,7 +1632,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   gfx_w > 600 ? ( div_x = r_pos - tweaker_w; r_pos = div_x - gap; ) : div_x = -1;
   rdc_x = r_pos - tweaker_w;
   r_pos = rdc_x - extra_gap;
-  g_common ? ( ch_x = r_pos - tweaker_w; r_pos = ch_x - gap; ) : ch_x = -1;
+  g_show_globals ? ( ch_x = r_pos - tweaker_w; r_pos = ch_x - gap; ) : ch_x = -1;
 
   wave_x = state_x + state_w;
   wave_w = max(r_pos - wave_x - gap, 30);
@@ -1800,7 +1800,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       fad_x >= 0 ? draw_value_tweaker(fad_x, t_ypos, t + st_fade_size, wantr, "FAD");
 
       // MIDI input tweakers (CH or per-note, right-aligned)
-      g_common ? (
+      g_show_globals ? (
         ch_x >= 0 ? draw_value_tweaker(ch_x, t_ypos, t + st_midichan, wantr, "CH");
       ) : (
         lx = ch_x >= 0 ? ch_x : rdc_x - (tweaker_w + gap) * 4;
@@ -1923,7 +1923,7 @@ function draw_position(ypos) local(last_pos,last_len)
   );
 );
 
-function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastclickcount, lastvclickoffs, lastoffs, lastsync, lastcommon)
+function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastclickcount, lastvclickoffs, lastoffs, lastsync, last_show_globals)
 (
   need_ref == 0 ? (
     need_ref = (lastlen != g_length || 
@@ -1933,7 +1933,7 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
                 lastlatch != g_latchmode ||
                 lastclickcount != (cfgp_clickcnt[]|0) ||
                 lastvclickoffs != cfgp_vclick[] ||
-                lastcommon != g_common);
+                last_show_globals != g_show_globals);
   );
 
   need_ref ? (
@@ -1968,7 +1968,7 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
     lastsync == 0 ?  gate_button.draw_topbar_button(gfx_x+4,2,cfgp_gate[] < g_infthreshdb ? "gate: -inf dB" : sprintf(#,"gate: %.0fdB",lastgate));
 
     latch_button.draw_topbar_button(gfx_x+4,2, (lastlatch=g_latchmode) ? "latch on" : "latch off");
-    common_button.draw_topbar_button(gfx_x+4,2, (lastcommon=g_common) ? "common on" : "common off");
+    common_button.draw_topbar_button(gfx_x+4,2, (last_show_globals=g_show_globals) ? "common on" : "common off");
   );
   
   (mouse_cap&1) && !(mouse_cap&2) ? ( 
@@ -1982,8 +1982,8 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
         // toggle
         cfgp_latch[] = g_latchmode = !g_latchmode;
       ) : common_button.hit_topbar_button(mouse_x,mouse_y,-1) ? (
-        g_common = !g_common;
-        mem_gen_cfg[23] = g_common;
+        g_show_globals = !g_show_globals;
+        mem_gen_cfg[23] = g_show_globals;
         sliderchange(-1); // persist to @serialize
         last_w = 0;       // force full redraw to show/hide common strip
       ) : (
