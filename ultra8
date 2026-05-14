@@ -1241,7 +1241,7 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
       (do_overlay=format_note(#str,t)) ? (
         do_overlay = do_overlay==1?"CC":"PC";
         gfx_measurestr(do_overlay,tw,th);
-        gfx_y=ypos + (lbl?(40-th):(42-th)*.5)- 4;
+        gfx_y=ypos + (lbl?(35-th):(37-th)*.5)- 4;
         gfx_x=xpos + (w-tw)*.5;
         do_overlay=="CC" ? gfx_set(0.9,.5,.2) : gfx_set(0.5,.5,.9);
         gfx_drawstr(do_overlay);
