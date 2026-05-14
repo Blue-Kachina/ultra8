@@ -852,6 +852,21 @@ ext_noinit == 0 ? (
   // Register JSFX sliders with the PR library (required before any PR display calls)
   pr_sync     = PR.NewSlider(1, 0, 0, 2);   // slider1: sync mode (0=off, 1=project, 2=playback)
   pr_clickcnt = PR.NewSlider(4, 0, 0, 64);  // slider4: click count / loop length
+
+  // ── Debug feedback emitter (Unit 2.2) ────────────────────────────────────────
+  // Emits a CC on MIDI channel 16 whenever per-lane state changes.
+  // Format: CC (100 + lane_index), value = st_state*8 + (dirty?4:0) + st_monmode
+  //   st_state 0/1/2 × 8 = 0/8/16; dirty bit = +4; monmode 0/1/2 = +0/+1/+2
+  // Channel 16 is safe: no NANO4 sends on ch16; Ultra8 common-mode gates on
+  //   st_midichan (default 1–8), so these CCs cannot trigger any lane action.
+  // CC 100–107 remap to note 229–236 in @sample — no Ultra8 assignment uses these.
+  // Set g_dbg_fb_enabled = 0 to silence the emitter without removing the code.
+  g_dbg_fb_enabled  = 1;
+  g_dbg_fb_chan     = 15;  // 0-indexed → MIDI channel 16
+  g_dbg_fb_cc_base  = 100; // CC 100 = lane 0, CC 101 = lane 1, …
+  g_dbg_fb_last     = alloc(g_nchan);
+  memset(g_dbg_fb_last, 255, g_nchan); // 255 = "not yet emitted" → force first emit
+  // ─────────────────────────────────────────────────────────────────────────────
 );
 
 @slider
@@ -1005,6 +1020,25 @@ function onblock()
 );
 
 <? loop(x=0;nch, printf("ch%d.onblock();\n",x+=1)) ?>
+
+// ── Debug feedback emitter (Unit 2.2) ────────────────────────────────────────
+// Fires once per audio block; emits a CC only when a lane's state has changed.
+g_dbg_fb_enabled ? (
+  g_dbg_i   = 0;
+  g_dbg_rec = mem_stlist;
+  loop(g_nchan,
+    g_dbg_t = g_dbg_rec[st_state] * 8
+            + (g_dbg_rec[st_dirty] > 0 ? 4 : 0)
+            + g_dbg_rec[st_monmode];
+    g_dbg_t != g_dbg_fb_last[g_dbg_i] ? (
+      midisend(0, 0xB0 | g_dbg_fb_chan, g_dbg_fb_cc_base + g_dbg_i, g_dbg_t);
+      g_dbg_fb_last[g_dbg_i] = g_dbg_t;
+    );
+    g_dbg_rec += st_num;
+    g_dbg_i   += 1;
+  );
+);
+// ─────────────────────────────────────────────────────────────────────────────
 
 (g_click_int = (cfgp_clickcnt[]|0)) > 0 ?(
   g_click_lenspls = (0.01*srate)|0;
