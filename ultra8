@@ -845,6 +845,97 @@ function emit_sysex_snapshot()
 );
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── SysEx Assignment Message Builder/Emitter (Unit 6.3) ─────────────────────
+//
+// decode_assignment(raw, out_buf, offset)
+//   Decodes a packed Ultra8 assignment integer into the two protocol bytes
+//   (msg_type + msg_number) and writes them at out_buf[offset..offset+1].
+//   Packed encoding: 0–127 = Note, 128 = Off, 129–257 = CC (n−129),
+//   258–386 = PC (n−258). See docs/ultra8_assignment_map.md §Packed Encoding.
+//
+// build_assign_snapshot()
+//   Fills g_assign_buf[0..22] with a complete 23-byte v0.1 assignment message.
+//   Does NOT increment the sequence counter or send MIDI.
+//   Packet layout: docs/protocol_assignment_metadata_v0_1.md
+//
+// emit_assign_snapshot()
+//   Increments g_assign_seq (14-bit, wraps at 16383), calls
+//   build_assign_snapshot(), sends via midisend_buf(). Reuses
+//   g_sysex_debug_enabled for optional console hex dump.
+//
+// Initialization (inside ext_noinit guard, below):
+//   g_assign_seq — separate 14-bit counter from g_sysex_seq; 0 on boot
+//   g_assign_buf — 23-float alloc block; one slot per MIDI byte
+
+function decode_assignment(raw, out_buf, offset)
+  local(atype, anum)
+(
+  raw >= 258 ? ( atype = 3; anum = raw - 258; ) :  // PC
+  raw >= 129 ? ( atype = 2; anum = raw - 129; ) :  // CC
+  raw == 128 ? ( atype = 0; anum = 0;         ) :  // Off
+              ( atype = 1; anum = raw;         );   // Note
+  out_buf[offset]     = atype & 0x7F;
+  out_buf[offset + 1] = anum  & 0x7F;
+);
+
+function build_assign_snapshot()
+(
+  // ── Header (bytes 0–6) ──────────────────────────────────────────────────────
+  g_assign_buf[0] = 0xF0;   // SysEx start
+  g_assign_buf[1] = 0x7D;   // Non-commercial / educational manufacturer ID
+  g_assign_buf[2] = 0x55;   // Ultra8 NANO4 protocol identifier
+  g_assign_buf[3] = 0x02;   // msg_type: assignment message (0x01 = state snapshot)
+
+  // Sequence number — 14-bit counter, split into two 7-bit bytes
+  g_assign_buf[4] = g_assign_seq & 0x7F;          // seq_lo: bits 6:0
+  g_assign_buf[5] = (g_assign_seq >> 7) & 0x7F;   // seq_hi: bits 13:7
+
+  g_assign_buf[6] = 5;   // num_controls: always 5 in v0.1
+
+  // ── Control blocks (bytes 7–21, 5 × 3 bytes) ───────────────────────────────
+  // Format per block: [control_id, msg_type_byte, msg_number]
+  // Source pointers: cfgp_common_rec/ply/clr/mon/undo[] (packed integer encoding)
+
+  g_assign_buf[7]  = 0;   // Control 0: REC_PLY — control_id
+  decode_assignment(cfgp_common_rec[], g_assign_buf, 8);
+
+  g_assign_buf[10] = 1;   // Control 1: PLY_STP — control_id
+  decode_assignment(cfgp_common_ply[], g_assign_buf, 11);
+
+  g_assign_buf[13] = 2;   // Control 2: CLR — control_id
+  decode_assignment(cfgp_common_clr[], g_assign_buf, 14);
+
+  g_assign_buf[16] = 3;   // Control 3: MON — control_id
+  decode_assignment(cfgp_common_mon[], g_assign_buf, 17);
+
+  g_assign_buf[19] = 4;   // Control 4: UNDO — control_id
+  decode_assignment(cfgp_common_undo[], g_assign_buf, 20);
+
+  // ── SysEx end (byte 22) ─────────────────────────────────────────────────────
+  g_assign_buf[22] = 0xF7;
+);
+
+function emit_assign_snapshot()
+  local(di)
+(
+  // Advance sequence counter (14-bit, wraps 16383 → 0)
+  g_assign_seq = (g_assign_seq + 1) & 0x3FFF;
+
+  build_assign_snapshot();
+  midisend_buf(0, g_assign_buf, 23);
+
+  g_sysex_debug_enabled ? (
+    printf("U8 ASSIGN seq=%d: ", g_assign_seq);
+    di = 0;
+    loop(23,
+      printf("%02X ", g_assign_buf[di] | 0);
+      di += 1;
+    );
+    printf("\n");
+  );
+);
+// ─────────────────────────────────────────────────────────────────────────────
+
 // one-time initialization
 ext_noinit == 0 ? (
   ext_noinit=1;
@@ -998,6 +1089,15 @@ ext_noinit == 0 ? (
   // g_sysex_period_rate = 0 disables the heartbeat (state-change path still works).
   g_sysex_period_rate    = 1.0;        // snapshots per second
   g_sysex_period_counter = srate | 0; // countdown in samples; first fire ~1 s after boot
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── Assignment Message Emitter — init (Unit 6.3) ────────────────────────────
+  // g_assign_seq: separate 14-bit counter from g_sysex_seq; 0 on boot; first
+  //              emitted packet = seq 1 (incremented before each emit)
+  // g_assign_buf: 23-float alloc block; one slot per MIDI byte
+  // Shares g_sysex_enabled and g_sysex_debug_enabled with the snapshot emitter.
+  g_assign_seq = 0;
+  g_assign_buf = alloc(23);
   // ─────────────────────────────────────────────────────────────────────────────
 );
 
@@ -1196,6 +1296,7 @@ g_sysex_enabled && g_sysex_dirty ? (
 g_sysex_enabled && g_sysex_period_rate > 0 ? (
   (g_sysex_period_counter -= samplesblock) <= 0 ? (
     emit_sysex_snapshot();
+    emit_assign_snapshot();  // Unit 6.3: assignment message piggybacks every heartbeat
     g_sysex_period_counter = (srate / g_sysex_period_rate) | 0;
   );
 );
