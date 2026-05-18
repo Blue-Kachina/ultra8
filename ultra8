@@ -946,7 +946,7 @@ ext_noinit == 0 ? (
   g_latchq = alloc(g_latchq_len*3);
   g_latchq_used=0;
 
-  mem_gen_sz=29;
+  mem_gen_sz=30;
   mem_gen_cfg = alloc(mem_gen_sz);
   memset(mem_gen_cfg,128,mem_gen_sz);
 
@@ -976,6 +976,7 @@ ext_noinit == 0 ? (
   cfgp_common_rev  = mem_gen_cfg + 28;
   mem_gen_cfg[23]  = 0; // g_show_globals: Globals bar off by default
   mem_gen_cfg[24]  = 0; // g_show_advanced: Advanced controls off by default
+  mem_gen_cfg[29]  = 1; // g_pulse: SysEx heartbeat on by default
   cfgp_common_rdc  = mem_gen_cfg + 25;
   cfgp_common_div  = mem_gen_cfg + 26;
   cfgp_common_fad  = mem_gen_cfg + 27;
@@ -1182,6 +1183,7 @@ function doconf() local(i,s) (
     g_slider_click_cnt = cfgp_clickcnt[]|0;
     g_show_globals = mem_gen_cfg[23]; // restore Globals toggle from saved state
     g_show_advanced = mem_gen_cfg[24]; // restore Advanced toggle from saved state
+    g_sysex_period_rate = mem_gen_cfg[29] ? 1.0 : 0; // restore Pulse toggle from saved state
     last_w=0;
   );
 );
@@ -1899,7 +1901,7 @@ function load_file(filename, channel) local(fh nch sr len rec rec2 buf buf2 v i)
 
 function draw(ixpos, ypos) local(i gap rec mode force_redraw
   mx my mw t lx ty tw th rec2 wl
-  now dropfile last_show_globals last_show_advanced tx
+  now dropfile last_show_globals last_show_advanced last_pulse tx
   lane_h avail_lanes action_y action_h
   pr_s state_w peak_w wave_w sub_w mon_w
   state_x peak_x wave_x sub_x mon_x midi_x
@@ -1914,13 +1916,15 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     lasthalve != cfgp_fade[] || lastlen != g_length ||
     lastoffs != g_offs || lastchanlink != cfgp_link[] ||
     last_show_globals != g_show_globals ||
-    last_show_advanced != g_show_advanced;
+    last_show_advanced != g_show_advanced ||
+    last_pulse != (g_sysex_period_rate > 0);
   lasthalve = cfgp_fade[];
   lastlen = g_length;
   lastoffs = g_offs;
   lastchanlink = cfgp_link[];
   last_show_globals = g_show_globals;
   last_show_advanced = g_show_advanced;
+  last_pulse = (g_sysex_period_rate > 0);
 
   gap = 4;
   now = time_precise();
@@ -2372,7 +2376,7 @@ function draw_position(ypos) local(last_pos,last_len)
   );
 );
 
-function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastclickcount, lastvclickoffs, lastoffs, lastsync, last_show_globals, last_show_advanced)
+function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastclickcount, lastvclickoffs, lastoffs, lastsync, last_show_globals, last_show_advanced, last_pulse)
 (
   need_ref == 0 ? (
     need_ref = (lastlen != g_length ||
@@ -2383,7 +2387,8 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
                 lastclickcount != (cfgp_clickcnt[]|0) ||
                 lastvclickoffs != cfgp_vclick[] ||
                 last_show_globals != g_show_globals ||
-                last_show_advanced != g_show_advanced);
+                last_show_advanced != g_show_advanced ||
+                last_pulse != (g_sysex_period_rate > 0));
   );
 
   need_ref ? (
@@ -2420,6 +2425,7 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
     latch_button.draw_topbar_button(gfx_x+4,2, (lastlatch=g_latchmode) ? "latch on" : "latch off");
     common_button.draw_topbar_button(gfx_x+4,2, (last_show_globals=g_show_globals) ? "Globals on" : "Globals off");
     advanced_button.draw_topbar_button(gfx_x+4,2, (last_show_advanced=g_show_advanced) ? "Advanced on" : "Advanced off");
+    pulse_button.draw_topbar_button(gfx_x+4,2, (last_pulse=(g_sysex_period_rate>0)) ? "Pulse on" : "Pulse off");
   );
 
   (mouse_cap&1) && !(mouse_cap&2) ? (
@@ -2442,6 +2448,10 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
         mem_gen_cfg[24] = g_show_advanced;
         sliderchange(-1); // persist to @serialize
         last_w = 0;       // force full redraw to show/hide advanced controls
+      ) : pulse_button.hit_topbar_button(mouse_x,mouse_y,-1) ? (
+        g_sysex_period_rate = g_sysex_period_rate > 0 ? 0 : 1.0;
+        mem_gen_cfg[29] = g_sysex_period_rate > 0;
+        sliderchange(-1); // persist to @serialize
       ) : (
         (lastsync==0 && (gate_button.hit_topbar_button(mouse_x,mouse_y,cfgp_gate)||
                          length_button.hit_topbar_button(mouse_x,mouse_y,cfgp_length)||
