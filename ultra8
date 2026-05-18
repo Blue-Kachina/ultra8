@@ -575,6 +575,11 @@ function clear_pair(idx) local(oidx pidx orec prec) (
 function onmsg(m1,m2,m3) instance(rec,note,note2,note3,note4,note5,note6,note7)
   local(newstate)
 (
+  // Per-lane mode (globals off): gate on MIDI channel so only the lane whose
+  // st_midichan matches the incoming channel responds.  UI-injected commands
+  // (m2 >= 1024) and common-mode (g_show_globals) bypass this filter — they
+  // have already been channel-resolved upstream.
+  m2 >= 1024 || g_show_globals || g_msg_chan == rec[st_midichan] ? (
    newstate = -1;
    (m2 == note && (m2 != note2 || rec[st_state]==0)) || m2 == 1024+rec+st_note1 ? (
      newstate = (rec[st_state] == 2 && g_was_firstrec==0) ? 1 : 2;
@@ -598,6 +603,7 @@ function onmsg(m1,m2,m3) instance(rec,note,note2,note3,note4,note5,note6,note7)
      setstate_pair(this.idx, newstate);
      select_pair(this.idx);
    );
+  );
 );
 
 function redraw_channels() local(p)
@@ -803,7 +809,7 @@ function estbpm(len) local(bpm, tsnum) global(ts_num, srate, cfgp_clickcnt)
 //                           one snapshot per block when set, then clears it
 
 function build_sysex_snapshot()
-  local(i, rec, lane_state, lane_dirty, lane_sel, lane_monmode, lane_flags, loop_phase)
+  local(i, rec, lane_state, lane_dirty, lane_sel, lane_monmode, lane_undo_redo, lane_flags, loop_phase)
 (
   // ── Header (bytes 0–3) ──────────────────────────────────────────────────────
   g_sysex_buf[0] = 0xF0;   // SysEx start
@@ -841,15 +847,21 @@ function build_sysex_snapshot()
     lane_dirty   = rec[st_dirty] > 0 ? 1 : 0;
     lane_sel     = (g_chan_selected == i) ? 1 : 0;
     lane_monmode = rec[st_monmode] & 0x03;
-    // Reverse bit (bit 6): always 0 in v0.1.
-    // chX.rev_state is an instance variable not mirrored in mem_stlist; adding it
-    // requires a protocol version bump (see docs/protocol_sysex_v0_1.md §Future).
+
+    // undo_redo_state (2-bit, packed into bits 4:3 of lane_info byte):
+    //   0 = neither available
+    //   1 = undo available  (st_undo_len > 0, redo not pending)
+    //   2 = redo available  (st_redo_len > 0; redo takes priority — matches toggle dispatch)
+    // See docs/protocol_sysex_v0_1.md §Undo/Redo State.
+    lane_undo_redo = rec[st_redo_len] > 0 ? 2
+                   : rec[st_undo_len] > 0 ? 1
+                   : 0;
 
     lane_flags = (lane_state   & 0x03)         // bits 1:0 — state enum
                | ((lane_dirty   & 0x01) << 2)  // bit 2    — dirty
                | ((lane_sel     & 0x01) << 3)  // bit 3    — selected
                | ((lane_monmode & 0x03) << 4); // bits 5:4 — monmode
-    // bit 6 = 0 (reverse, deferred), bit 7 = 0 (7-bit MIDI safety)
+    // bit 6 = 0 (reserved for reverse, v0.2), bit 7 = 0 (7-bit MIDI safety)
 
     // Loop phase 0–127: fractional position through the loop.
     // 0 when lane is stopped or no loop length exists yet.
@@ -857,7 +869,7 @@ function build_sysex_snapshot()
                  ? min(127, g_pos / g_length * 127 | 0)
                  : 0;
 
-    g_sysex_buf[8 + i*3]     = i;           // lane_index (sanity-check byte)
+    g_sysex_buf[8 + i*3]     = i | ((lane_undo_redo & 0x03) << 3); // lane_info: index + undo_redo_state
     g_sysex_buf[8 + i*3 + 1] = lane_flags;
     g_sysex_buf[8 + i*3 + 2] = loop_phase;
 
@@ -1510,7 +1522,12 @@ while (sidx == nextmsg_offs)
       // e.g. common_recply_pair called twice reverses itself (0→2→1 = green, not red).
       mem_stlist[g_cmn_i*st_num + st_midichan] == g_msg_chan && nextmsg_3 ? (
         g_cmn_rec = mem_stlist + g_cmn_i*st_num;
-        nextmsg_2 == cfgp_common_rec[] ? (
+        // Dispatch is keyed on the matched lane's own per-lane assignment values
+        // (g_cmn_rec[st_note*]), NOT on the global cfgp_common_* templates.
+        // This keeps MIDI routing in sync with whatever is shown in each lane's
+        // row — whether the user edited via the globals row or per-lane tweakers.
+        // cfgp_common_* remain as UI templates propagated by draw_global_tweaker.
+        nextmsg_2 == g_cmn_rec[st_note1] ? (
           // REC/PLY: recording→play; stopped/playing→record/overdub.
           g_dbg_cmn_state0 = g_cmn_rec[st_state];
           g_dbg_cmn_dirty0 = g_cmn_rec[st_dirty];
@@ -1521,14 +1538,14 @@ while (sidx == nextmsg_offs)
           g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == cfgp_common_clr[] ? (
+        nextmsg_2 == g_cmn_rec[st_note5] ? (
           // Clear lane(s): pair-aware — stops, zeros buffer, drops undo snapshot
           strcpy(g_dbg_cmn_name, "CLR");
           g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
           clear_pair(g_cmn_i);
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == cfgp_common_ply[] ? (
+        nextmsg_2 == g_cmn_rec[st_note2] ? (
           // PLY/STP: recording→play; playing→stop; stopped+content→play; empty→no-op.
           g_dbg_cmn_state0 = g_cmn_rec[st_state];
           g_dbg_cmn_dirty0 = g_cmn_rec[st_dirty];
@@ -1539,14 +1556,14 @@ while (sidx == nextmsg_offs)
           g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == cfgp_common_rev[] ? (
+        nextmsg_2 == g_cmn_rec[st_note4] ? (
           // REV: pair-aware reverse toggle
           strcpy(g_dbg_cmn_name, "REV");
           g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
           reverse_pair(g_cmn_i);
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == cfgp_common_undo[] ? (
+        nextmsg_2 == g_cmn_rec[st_note6] ? (
           // Unit 2.1: toggle — REDO if redo stack is available, otherwise UNDO.
           // Both paths are pair-aware and restore both lanes when linked.
           g_cmn_rec[st_redo_len] > 0 ? (
@@ -1560,13 +1577,13 @@ while (sidx == nextmsg_offs)
           );
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == cfgp_common_sel[] ? (
+        nextmsg_2 == g_cmn_rec[st_note3] ? (
           strcpy(g_dbg_cmn_name, "SEL");
           g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
           nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note3;
           common_dispatch = 1; // translated: allow lane dispatch
         ) :
-        nextmsg_2 == cfgp_common_mon[] ? (
+        nextmsg_2 == g_cmn_rec[st_note7] ? (
           // MON: disabled↔always-monitor (auto/selected treated as not-always).
           g_dbg_cmn_state0 = g_cmn_rec[st_monmode];
           common_mon_pair(g_cmn_i);
@@ -1585,7 +1602,7 @@ while (sidx == nextmsg_offs)
     // only translated common commands (common_dispatch=1) reach chan_onmsg / latch queue.
     // Raw per-lane assignments are blocked while g_show_globals is enabled (Option A).
     // Global controls (reset, halve, etc.) are checked below regardless of common mode.
-    (1 || common_dispatch || g_ui_dispatch) ? (
+    (!g_show_globals || common_dispatch || g_ui_dispatch) ? (
       (!g_latchmode || g_pos == 0 || g_firstrec) ? (
         chan_onmsg(nextmsg_1,nextmsg_2,nextmsg_3);
       ) : (
