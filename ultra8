@@ -943,20 +943,26 @@ function build_assign_snapshot()
   // Format per block: [control_id, msg_type_byte, msg_number]
   // Source pointers: cfgp_common_rec/ply/clr/mon/undo[] (packed integer encoding)
 
+  // Use per-lane values for g_chan_selected so that per-lane tweaker overrides
+  // are reflected in the snapshot.  draw_global_tweaker keeps per-lane values
+  // equal to the globals in common mode, so this is always at least as correct
+  // as reading cfgp_common_* directly.
+  g_snap_sel = (g_chan_selected >= 0 ? g_chan_selected : 0) * st_num + mem_stlist;
+
   g_assign_buf[7]  = 0;   // Control 0: REC_PLY — control_id
-  decode_assignment(cfgp_common_rec[], g_assign_buf, 8);
+  decode_assignment(g_snap_sel[st_note1], g_assign_buf, 8);
 
   g_assign_buf[10] = 1;   // Control 1: PLY_STP — control_id
-  decode_assignment(cfgp_common_ply[], g_assign_buf, 11);
+  decode_assignment(g_snap_sel[st_note2], g_assign_buf, 11);
 
   g_assign_buf[13] = 2;   // Control 2: CLR — control_id
-  decode_assignment(cfgp_common_clr[], g_assign_buf, 14);
+  decode_assignment(g_snap_sel[st_note5], g_assign_buf, 14);
 
   g_assign_buf[16] = 3;   // Control 3: MON — control_id
-  decode_assignment(cfgp_common_mon[], g_assign_buf, 17);
+  decode_assignment(g_snap_sel[st_note7], g_assign_buf, 17);
 
   g_assign_buf[19] = 4;   // Control 4: UNDO — control_id
-  decode_assignment(cfgp_common_undo[], g_assign_buf, 20);
+  decode_assignment(g_snap_sel[st_note6], g_assign_buf, 20);
 
   // ── SysEx end (byte 22) ─────────────────────────────────────────────────────
   g_assign_buf[22] = 0xF7;
@@ -1143,12 +1149,26 @@ ext_noinit == 0 ? (
   // ─────────────────────────────────────────────────────────────────────────────
 
   // ── Assignment Message Emitter — init (Unit 6.3) ────────────────────────────
-  // g_assign_seq: separate 14-bit counter from g_sysex_seq; 0 on boot; first
-  //              emitted packet = seq 1 (incremented before each emit)
-  // g_assign_buf: 23-float alloc block; one slot per MIDI byte
+  // g_assign_seq:    separate 14-bit counter from g_sysex_seq; 0 on boot; first
+  //                  emitted packet = seq 1 (incremented before each emit)
+  // g_assign_buf:    23-float alloc block; one slot per MIDI byte
+  // g_assign_shadow: 5-float shadow of per-lane st_note1/2/5/7/6 for the
+  //                  currently selected lane (g_chan_selected), used by @block
+  //                  to detect assignment changes between heartbeats.  Covers
+  //                  both global header-row tweakers and per-lane row tweakers.
+  //                  Initialised to -1 so the very first @block always emits.
+  // g_assign_dirty:  set to 1 by the on-change detector in @block; cleared
+  //                  after emit_assign_snapshot().
   // Shares g_sysex_enabled and g_sysex_debug_enabled with the snapshot emitter.
   g_assign_seq = 0;
   g_assign_buf = alloc(23);
+  g_assign_shadow    = alloc(5);
+  g_assign_shadow[0] = -1;   // rec  — -1 forces emit on first block
+  g_assign_shadow[1] = -1;   // ply
+  g_assign_shadow[2] = -1;   // clr
+  g_assign_shadow[3] = -1;   // mon
+  g_assign_shadow[4] = -1;   // undo
+  g_assign_dirty = 0;
   // ─────────────────────────────────────────────────────────────────────────────
 );
 
@@ -1339,6 +1359,37 @@ g_sysex_enabled && g_sysex_dirty ? (
 );
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── Assignment SysEx — on-change emission ────────────────────────────────────
+// Detects when any of the five MIDI assignments change and immediately emits
+// an assignment snapshot without waiting for the next heartbeat.
+// Tracks per-lane st_note* values for g_chan_selected so that both the global
+// header-row tweakers AND the per-lane row tweakers trigger an update.
+// draw_global_tweaker keeps per-lane values in sync with globals in common mode,
+// so the behavior is identical when all lanes share the same assignments.
+// g_assign_shadow[] holds the last-known packed values for the selected lane;
+// a mismatch on any slot sets g_assign_dirty and triggers an emit this block.
+// The heartbeat path (below) still emits every period for reconnect recovery.
+g_sysex_enabled ? (
+  g_eff_sel = (g_chan_selected >= 0 ? g_chan_selected : 0) * st_num + mem_stlist;
+  (g_eff_sel[st_note1] != g_assign_shadow[0] ||
+   g_eff_sel[st_note2] != g_assign_shadow[1] ||
+   g_eff_sel[st_note5] != g_assign_shadow[2] ||
+   g_eff_sel[st_note7] != g_assign_shadow[3] ||
+   g_eff_sel[st_note6] != g_assign_shadow[4]) ? (
+    g_assign_shadow[0] = g_eff_sel[st_note1];
+    g_assign_shadow[1] = g_eff_sel[st_note2];
+    g_assign_shadow[2] = g_eff_sel[st_note5];
+    g_assign_shadow[3] = g_eff_sel[st_note7];
+    g_assign_shadow[4] = g_eff_sel[st_note6];
+    g_assign_dirty = 1;
+  );
+  g_assign_dirty ? (
+    emit_assign_snapshot();
+    g_assign_dirty = 0;
+  );
+);
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ── SysEx Snapshot — periodic heartbeat (Unit 3.5) ───────────────────────────
 // Fires emit_sysex_snapshot() at g_sysex_period_rate Hz regardless of state.
 // Allows a NANO4 that power-cycled or missed a packet to recover automatically
@@ -1348,7 +1399,7 @@ g_sysex_enabled && g_sysex_dirty ? (
 g_sysex_enabled && g_sysex_period_rate > 0 ? (
   (g_sysex_period_counter -= samplesblock) <= 0 ? (
     emit_sysex_snapshot();
-    emit_assign_snapshot();  // Unit 6.3: assignment message piggybacks every heartbeat
+    emit_assign_snapshot();  // heartbeat: piggyback for reconnect recovery
     g_sysex_period_counter = (srate / g_sysex_period_rate) | 0;
   );
 );
