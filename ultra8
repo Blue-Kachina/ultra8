@@ -976,7 +976,7 @@ ext_noinit == 0 ? (
   cfgp_common_rev  = mem_gen_cfg + 28;
   mem_gen_cfg[23]  = 0; // g_show_globals: Globals bar off by default
   mem_gen_cfg[24]  = 0; // g_show_advanced: Advanced controls off by default
-  mem_gen_cfg[29]  = 1; // g_pulse: SysEx heartbeat on by default
+  mem_gen_cfg[29]  = 0; // g_pulse: SysEx heartbeat off by default (QoL 1.1)
   cfgp_common_rdc  = mem_gen_cfg + 25;
   cfgp_common_div  = mem_gen_cfg + 26;
   cfgp_common_fad  = mem_gen_cfg + 27;
@@ -1088,7 +1088,7 @@ ext_noinit == 0 ? (
   // Periodic heartbeat (Unit 3.5): emit a snapshot at this rate even with no
   // state changes, so a NANO4 that power-cycled can recover automatically.
   // g_sysex_period_rate = 0 disables the heartbeat (state-change path still works).
-  g_sysex_period_rate    = 1.0;        // snapshots per second
+  g_sysex_period_rate    = 0;          // off by default; restored from mem_gen_cfg[29] via @serialize
   g_sysex_period_counter = srate | 0; // countdown in samples; first fire ~1 s after boot
   // ─────────────────────────────────────────────────────────────────────────────
 
