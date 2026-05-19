@@ -534,9 +534,11 @@ function rev_stop() instance (rec)
 function reverse() instance(rec) local(l)
 (
   atomic_add(this.rev_requested,1);
+  this.rev_active = this.rev_active ? 0 : 1; // toggle persistent reversed-state flag
   l = (g_length * this.div)|0;
   rec[st_dirty] = this.dirty_top = max(rec[st_dirty],max(this.dirty_top,l));
   rec[st_lastd] = -1;
+  g_sysex_dirty = 1; // schedule snapshot so NANO4 sees rev_active change immediately
 );
 
 // Reverse both lanes of a pair (or just the one if unlinked).
@@ -556,7 +558,7 @@ function clear_pair(idx) local(oidx pidx orec prec) (
   pidx = pair_partner_idx(oidx);
   orec = mem_stlist + oidx * st_num;
   // Clear owner
-  <? loop(x=0;nch, printf("oidx == %d ? (ch%d.setstate(0); ch%d.rev_stop(); ch%d.dirty_top=-1;) :\n",x,x+1,x+1,x+1); x+=1;) ?> 0;
+  <? loop(x=0;nch, printf("oidx == %d ? (ch%d.setstate(0); ch%d.rev_stop(); ch%d.rev_active=0; ch%d.dirty_top=-1;) :\n",x,x+1,x+1,x+1,x+1); x+=1;) ?> 0;
   orec[st_dirty] > 0 ? memset(orec[st_buf], 0, orec[st_dirty]);
   orec[st_dirty] = 0;
   orec[st_undo_len] = 0;
@@ -564,7 +566,7 @@ function clear_pair(idx) local(oidx pidx orec prec) (
   // Clear partner when linked
   pidx >= 0 ? (
     prec = mem_stlist + pidx * st_num;
-    <? loop(x=0;nch, printf("pidx == %d ? (ch%d.setstate(0); ch%d.rev_stop(); ch%d.dirty_top=-1;) :\n",x,x+1,x+1,x+1); x+=1;) ?> 0;
+    <? loop(x=0;nch, printf("pidx == %d ? (ch%d.setstate(0); ch%d.rev_stop(); ch%d.rev_active=0; ch%d.dirty_top=-1;) :\n",x,x+1,x+1,x+1,x+1); x+=1;) ?> 0;
     prec[st_dirty] > 0 ? memset(prec[st_buf], 0, prec[st_dirty]);
     prec[st_dirty] = 0;
     prec[st_undo_len] = 0;
@@ -763,7 +765,7 @@ function reset() local(lp)
 (
   g_chan_selected=-1;
   // setstate() will latch dirty_top to st_dirty
-  <? loop(x=0;nch, x+=1; printf("ch%d.setstate(0); ch%d.rev_stop(); ch%d.dirty_top=-1;\n",x,x,x)) ?>
+  <? loop(x=0;nch, x+=1; printf("ch%d.setstate(0); ch%d.rev_stop(); ch%d.rev_active=0; ch%d.dirty_top=-1;\n",x,x,x,x)) ?>
   lp = mem_stlist;
   loop(g_nchan,
     lp[st_dirty] > 0 ? (
@@ -809,7 +811,7 @@ function estbpm(len) local(bpm, tsnum) global(ts_num, srate, cfgp_clickcnt)
 //                           one snapshot per block when set, then clears it
 
 function build_sysex_snapshot()
-  local(i, rec, lane_state, lane_dirty, lane_sel, lane_monmode, lane_undo_redo, lane_flags, loop_phase)
+  local(i, rec, lane_state, lane_dirty, lane_sel, lane_rev_active, lane_undo_redo, lane_flags, loop_phase)
 (
   // ── Header (bytes 0–3) ──────────────────────────────────────────────────────
   g_sysex_buf[0] = 0xF0;   // SysEx start
@@ -844,9 +846,9 @@ function build_sysex_snapshot()
     // Safety: map any unknown/out-of-range value to STOPPED (safe fallback)
     (lane_state < 0 || lane_state > 3) ? lane_state = 0;
 
-    lane_dirty   = rec[st_dirty] > 0 ? 1 : 0;
-    lane_sel     = (g_chan_selected == i) ? 1 : 0;
-    lane_monmode = rec[st_monmode] & 0x03;
+    lane_dirty      = rec[st_dirty] > 0 ? 1 : 0;
+    lane_sel        = (g_chan_selected == i) ? 1 : 0;
+    lane_rev_active = (<? loop(x=0;nch, printf("i==%d?ch%d.rev_active:\n",x,x+1)) ?> 0) & 0x01;
 
     // undo_redo_state (2-bit, packed into bits 4:3 of lane_info byte):
     //   0 = neither available
@@ -857,11 +859,11 @@ function build_sysex_snapshot()
                    : rec[st_undo_len] > 0 ? 1
                    : 0;
 
-    lane_flags = (lane_state   & 0x03)         // bits 1:0 — state enum
-               | ((lane_dirty   & 0x01) << 2)  // bit 2    — dirty
-               | ((lane_sel     & 0x01) << 3)  // bit 3    — selected
-               | ((lane_monmode & 0x03) << 4); // bits 5:4 — monmode
-    // bit 6 = 0 (reserved for reverse, v0.2), bit 7 = 0 (7-bit MIDI safety)
+    lane_flags = (lane_state      & 0x03)         // bits 1:0 — state enum
+               | ((lane_dirty      & 0x01) << 2)  // bit 2    — dirty
+               | ((lane_sel        & 0x01) << 3)  // bit 3    — selected
+               | ((lane_rev_active & 0x01) << 6); // bit 6    — reverse active (monmode removed)
+    // bits 5:4 = 0 (monmode removed in v0.2), bit 7 = 0 (7-bit MIDI safety)
 
     // Loop phase 0–127: fractional position through the loop.
     // 0 when lane is stopped or no loop length exists yet.
@@ -949,11 +951,11 @@ function build_assign_snapshot()
   g_assign_buf[4] = g_assign_seq & 0x7F;          // seq_lo: bits 6:0
   g_assign_buf[5] = (g_assign_seq >> 7) & 0x7F;   // seq_hi: bits 13:7
 
-  g_assign_buf[6] = 5;   // num_controls: always 5 in v0.1
+  g_assign_buf[6] = 6;   // num_controls: always 6 (added REV as control ID 5)
 
-  // ── Control blocks (bytes 7–21, 5 × 3 bytes) ───────────────────────────────
+  // ── Control blocks (bytes 7–24, 6 × 3 bytes) ───────────────────────────────
   // Format per block: [control_id, msg_type_byte, msg_number]
-  // Source pointers: cfgp_common_rec/ply/clr/mon/undo[] (packed integer encoding)
+  // Source pointers: per-lane st_note* for g_chan_selected (packed integer encoding)
 
   // Use per-lane values for g_chan_selected so that per-lane tweaker overrides
   // are reflected in the snapshot.  draw_global_tweaker keeps per-lane values
@@ -976,8 +978,11 @@ function build_assign_snapshot()
   g_assign_buf[19] = 4;   // Control 4: UNDO — control_id
   decode_assignment(g_snap_sel[st_note6], g_assign_buf, 20);
 
-  // ── SysEx end (byte 22) ─────────────────────────────────────────────────────
-  g_assign_buf[22] = 0xF7;
+  g_assign_buf[22] = 5;   // Control 5: REV — control_id
+  decode_assignment(g_snap_sel[st_note4], g_assign_buf, 23);
+
+  // ── SysEx end (byte 25) ─────────────────────────────────────────────────────
+  g_assign_buf[25] = 0xF7;
 );
 
 function emit_assign_snapshot()
@@ -987,12 +992,12 @@ function emit_assign_snapshot()
   g_assign_seq = (g_assign_seq + 1) & 0x3FFF;
 
   build_assign_snapshot();
-  midisend_buf(0, g_assign_buf, 23);
+  midisend_buf(0, g_assign_buf, 26);
 
   g_sysex_debug_enabled ? (
     printf("U8 ASSIGN seq=%d: ", g_assign_seq);
     di = 0;
-    loop(23,
+    loop(26,
       printf("%02X ", g_assign_buf[di] | 0);
       di += 1;
     );
@@ -1163,8 +1168,8 @@ ext_noinit == 0 ? (
   // ── Assignment Message Emitter — init (Unit 6.3) ────────────────────────────
   // g_assign_seq:    separate 14-bit counter from g_sysex_seq; 0 on boot; first
   //                  emitted packet = seq 1 (incremented before each emit)
-  // g_assign_buf:    23-float alloc block; one slot per MIDI byte
-  // g_assign_shadow: 5-float shadow of per-lane st_note1/2/5/7/6 for the
+  // g_assign_buf:    26-float alloc block; one slot per MIDI byte (6 controls)
+  // g_assign_shadow: 6-float shadow of per-lane st_note1/2/5/7/6/4 for the
   //                  currently selected lane (g_chan_selected), used by @block
   //                  to detect assignment changes between heartbeats.  Covers
   //                  both global header-row tweakers and per-lane row tweakers.
@@ -1173,13 +1178,14 @@ ext_noinit == 0 ? (
   //                  after emit_assign_snapshot().
   // Shares g_sysex_enabled and g_sysex_debug_enabled with the snapshot emitter.
   g_assign_seq = 0;
-  g_assign_buf = alloc(23);
-  g_assign_shadow    = alloc(5);
+  g_assign_buf = alloc(26);
+  g_assign_shadow    = alloc(6);
   g_assign_shadow[0] = -1;   // rec  — -1 forces emit on first block
   g_assign_shadow[1] = -1;   // ply
   g_assign_shadow[2] = -1;   // clr
   g_assign_shadow[3] = -1;   // mon
   g_assign_shadow[4] = -1;   // undo
+  g_assign_shadow[5] = -1;   // rev
   g_assign_dirty = 0;
   // ─────────────────────────────────────────────────────────────────────────────
 );
@@ -1387,12 +1393,14 @@ g_sysex_enabled ? (
    g_eff_sel[st_note2] != g_assign_shadow[1] ||
    g_eff_sel[st_note5] != g_assign_shadow[2] ||
    g_eff_sel[st_note7] != g_assign_shadow[3] ||
-   g_eff_sel[st_note6] != g_assign_shadow[4]) ? (
+   g_eff_sel[st_note6] != g_assign_shadow[4] ||
+   g_eff_sel[st_note4] != g_assign_shadow[5]) ? (
     g_assign_shadow[0] = g_eff_sel[st_note1];
     g_assign_shadow[1] = g_eff_sel[st_note2];
     g_assign_shadow[2] = g_eff_sel[st_note5];
     g_assign_shadow[3] = g_eff_sel[st_note7];
     g_assign_shadow[4] = g_eff_sel[st_note6];
+    g_assign_shadow[5] = g_eff_sel[st_note4];
     g_assign_dirty = 1;
   );
   g_assign_dirty ? (
