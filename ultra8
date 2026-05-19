@@ -1188,6 +1188,12 @@ ext_noinit == 0 ? (
   g_assign_shadow[5] = -1;   // rev
   g_assign_dirty = 0;
   // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── UI open detection — init (IG-1) ─────────────────────────────────────────
+  // Tracks whether the @gfx window was open (gfx_w > 0) in the previous frame.
+  // Initialised to 0 so the first frame where gfx_w > 0 is detected as an open.
+  g_prev_gfx_open = 0;
+  // ─────────────────────────────────────────────────────────────────────────────
 );
 
 @slider
@@ -1669,6 +1675,20 @@ g_prevent_processing===0 ? (
 @gfx 900 760
 
 get_section('gfx');
+
+// ── SysEx burst on UI open / reopen (IG-1) ───────────────────────────────────
+// gfx_w is 0 while the window is closed and > 0 while it is visible.
+// When the window transitions from closed → open, schedule both a state snapshot
+// and an assignment snapshot for the next @block. The existing @block emission
+// paths (g_sysex_dirty / g_assign_dirty) handle the actual midisend_buf call.
+(gfx_w > 0) != g_prev_gfx_open ? (
+  g_prev_gfx_open = (gfx_w > 0);
+  g_prev_gfx_open ? (
+    g_sysex_dirty  = 1;
+    g_assign_dirty = 1;
+  );
+);
+// ─────────────────────────────────────────────────────────────────────────────
 
 function format_note(str, note) //1=CC,2=PC
 (
