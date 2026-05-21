@@ -975,7 +975,7 @@ function build_assign_snapshot()
   g_assign_buf[16] = 3;   // Control 3: MON — control_id
   decode_assignment(g_snap_sel[st_note7], g_assign_buf, 17);
 
-  g_assign_buf[19] = 4;   // Control 4: UNDO — control_id
+  g_assign_buf[19] = 4;   // Control 4: UNDO_REDO — control_id
   decode_assignment(g_snap_sel[st_note6], g_assign_buf, 20);
 
   g_assign_buf[22] = 5;   // Control 5: REV — control_id
