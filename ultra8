@@ -129,7 +129,12 @@ st_undo_buf  = 15; // pointer to pre-allocated undo snapshot buffer
 st_undo_len  = 16; // samples stored in snapshot (0 = no snapshot available)
 st_redo_buf  = 20; // pointer to pre-allocated redo snapshot buffer (Unit 2.1)
 st_redo_len  = 21; // samples stored in redo snapshot (0 = no redo available)
-st_num = 22;
+// ── Flex Mode per-lane length metadata (Phase 1) ─────────────────────────────
+st_loop_len      = 22; // committed loop length in samples (0 = empty / not yet set)
+st_undo_loop_len = 23; // loop length saved alongside the undo audio snapshot
+st_redo_loop_len = 24; // loop length saved alongside the redo audio snapshot
+// ─────────────────────────────────────────────────────────────────────────────
+st_num = 25;
 
 function recalc_fades() (
   g_fadespeed = exp(-1/(srate * 0.002));  // fade speed for monitoring
@@ -189,6 +194,10 @@ function init(x, n1,n2,n3)
   rec[st_undo_len] = 0;     // no snapshot initially
   rec[st_redo_buf] = 0;     // set by post-init alloc loop (Unit 2.1)
   rec[st_redo_len] = 0;     // no redo available initially
+  // Flex Mode length metadata — all zero until a Flex recording commits (Phase 1)
+  rec[st_loop_len]      = 0;
+  rec[st_undo_loop_len] = 0;
+  rec[st_redo_loop_len] = 0;
 
   this.updatefromrec();
 );
@@ -215,55 +224,6 @@ function process_need_zero(p1, p2) global()
   nz_2 >= need_zero && nz_1 >= nz_1e && nz_0>=nz_0e ? need_zero=0;
 );
 
-function setstate(st) instance(fpos_slope, fpos2_slope, rec) local(dt)
-(
-  rec[st_state] ? (
-    st==0 ? (
-      g_active_mask &= -(1<<this.idx + 1);
-    ) : g_length > 0 ? (
-      g_firstrec = 0;
-      g_prevent_processing &= 0xe;
-      this.extra_recording = (g_pos == 0 || g_pos == g_length) ? (0|min(srate*.5, g_maxlen-g_length)) : 0;
-    );
-  ) : (
-    st>0 ? (
-      st == 2 && (dt = max(rec[st_dirty], this.dirty_top+1)) > 0 ? (
-        this.set_need_zero(dt);
-        this.dirty_top=-1;
-        rec[st_dirty]=0;
-      );
-
-      (g_active_mask |= (1<<this.idx)) == (1<<this.idx) ? (
-        st == 2 ? (
-          cfgp_gate[] > g_infthreshdb && cfgp_sync[] == 0 ? (
-            g_recstart_gate = 10^(cfgp_gate[]/20);
-            g_prevent_processing |= 1;
-          ) : (
-            g_prevent_processing &= 0xe;
-          );
-
-          cfgp_sync[] == 0 ? (
-            g_pos = g_offs = g_length = 0;
-            g_firstrec = 1+this.idx;
-          );
-        );
-      );
-    );
-  );
-  rec[st_state] = st;
-  rec[st_dirty] = max(max(rec[st_dirty],this.dirty_top+1),st==2);
-
-  st == 2 ? (
-    fpos_slope = g_slope_recin;
-    fpos2_slope = g_slope_playin;
-  ) : (
-    fpos_slope = g_slope_recout;
-    fpos2_slope = st > 0 ? g_slope_playin :
-                  (rec[st_fade_size]>0) ? -1/(rec[st_fade_size]*g_length) :
-                  g_slope_playout;
-  );
-  g_sysex_dirty = 1; // Unit 3.4: schedule a snapshot on the next @block
-);
 
 function get_linked_rec(idx) (
   cfgp_link[]&(1<<(idx>>1)) ? mem_stlist+st_num*(idx~1) : -1;
@@ -320,6 +280,226 @@ function pair_has_content(idx) local(oidx pidx orec prec has) (
 );
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── Flex Mode helpers (Phase 1 / Phase 2) ────────────────────────────────────
+
+// Returns non-zero when Flex Mode is active.
+function is_flex_mode() ( g_flex_enabled != 0; );
+
+// Returns non-zero when a base quantum has been established.
+function has_flex_base() ( g_flex_base_len > 0; );
+
+// Returns the committed loop length for the given lane, resolving through the
+// pair owner when lanes are linked.  Returns 0 when the lane is empty.
+function get_effective_loop_len(idx) local(oidx orec) (
+  oidx = pair_owner_idx(idx);
+  orec = mem_stlist + oidx * st_num;
+  orec[st_loop_len];
+);
+
+// Sets st_loop_len on both the owner and the partner lane (when linked).
+function set_effective_loop_len(idx, len) local(oidx pidx orec prec) (
+  oidx = pair_owner_idx(idx);
+  pidx = pair_partner_idx(oidx);
+  orec = mem_stlist + oidx * st_num;
+  orec[st_loop_len] = len;
+  pidx >= 0 ? (
+    prec = mem_stlist + pidx * st_num;
+    prec[st_loop_len] = len;
+  );
+);
+
+// Returns the effective playback length for lane idx:
+//   Flex Mode + lane has content  → get_effective_loop_len(idx)
+//   Flex Mode + lane empty        → g_flex_base_len (or g_length fallback)
+//   Non-Flex Mode                 → g_length
+function get_lane_play_len(idx) local(ll) (
+  is_flex_mode() ? (
+    ll = get_effective_loop_len(idx);
+    ll > 0 ? ll : (g_flex_base_len > 0 ? g_flex_base_len : g_length);
+  ) : (
+    g_length;
+  );
+);
+
+// Returns the effective playback position for lane idx:
+//   Flex Mode (steady-state, g_firstrec==0) → g_flex_pos modulo the lane's own play length
+//   Flex Mode (first-rec, g_firstrec>0)     → g_pos (avoids g_pos%g_pos=0 trap)
+//   Non-Flex                                → g_pos
+function get_lane_play_pos(idx) local(ll) (
+  is_flex_mode() && g_firstrec == 0 ? (
+    ll = get_lane_play_len(idx);
+    ll > 0 ? g_flex_pos % ll : 0;
+  ) : (
+    g_pos;
+  );
+);
+
+// Returns the committed length multiple relative to the Flex base.
+// Returns 0 for empty lanes or when no base exists.
+function get_lane_length_multiple(idx) local(ll) (
+  (g_flex_base_len > 0 && (ll = get_effective_loop_len(idx)) > 0) ?
+    (ll / g_flex_base_len + 0.5) | 0 : 0;
+);
+
+// ── Flex Mode recording helpers (Phase 5 quantization) ───────────────────────
+
+// Quantize a raw recorded length to the nearest musical multiple of g_flex_base_len.
+// Rules (see flex_mode.md §Quantization Rules):
+//   1. Default: ceiling — round UP to the next whole multiple.
+//   2. Late-stop tolerance: if the raw length is within g_flex_late_tolerance_smpls
+//      samples PAST the nearest lower boundary, snap DOWN to that boundary.
+//   3. Minimum committed multiple = 1.
+//   4. Maximum committed length = largest whole multiple ≤ g_maxlen.
+// Returns 0 on invalid input (no base, base == 0, raw_len == 0).
+function quantize_flex_record_len(raw_len) local(base, nearest_boundary, lateness, mult, max_mult, committed) (
+  base = g_flex_base_len;
+  (base <= 0 || raw_len <= 0) ? (
+    0;  // degenerate — caller should treat 0 as a failure
+  ) : (
+    // Late-stop tolerance: snap down to nearest_boundary if within tolerance.
+    nearest_boundary = (raw_len / base + 0.5) | 0;  // round to nearest integer multiple
+    nearest_boundary = max(1, nearest_boundary) * base;
+    lateness = raw_len - nearest_boundary;
+    (lateness > 0 && lateness <= g_flex_late_tolerance_smpls) ? (
+      committed = nearest_boundary;
+    ) : (
+      // Ceiling: round up to the next whole multiple.
+      mult = max(1, ceil(raw_len / base));
+      committed = mult * base;
+    );
+
+    // Clamp to maximum safe multiple within the per-lane buffer.
+    max_mult = floor(g_maxlen / base);
+    max_mult < 1 ? max_mult = 1;
+    committed > max_mult * base ? committed = max_mult * base;
+
+    committed;
+  );
+);
+
+// Commit a Flex empty-lane recording: quantize, pad silence, set state metadata.
+// raw_len = number of samples actually recorded into buf.
+// Operates on both lanes of a pair.
+// Caller must follow up with setstate_pair(idx, 1) to enter playback.
+function flex_commit_empty_lane_recording(idx, raw_len)
+  local(oidx pidx orec prec committed pad_start buf)
+(
+  committed = quantize_flex_record_len(raw_len);
+  committed <= 0 ? committed = raw_len;  // fallback: use raw if quantize fails
+
+  oidx = pair_owner_idx(idx);
+  pidx = pair_partner_idx(oidx);
+
+  // Owner lane
+  orec = mem_stlist + oidx * st_num;
+  buf  = orec[st_buf];
+  pad_start = min(raw_len, committed);
+  pad_start < committed ? memset(buf + pad_start, 0, committed - pad_start);
+  orec[st_dirty]    = committed;
+  orec[st_loop_len] = committed;
+
+  // Partner lane (linked stereo pair)
+  pidx >= 0 ? (
+    prec = mem_stlist + pidx * st_num;
+    buf  = prec[st_buf];
+    pad_start < committed ? memset(buf + pad_start, 0, committed - pad_start);
+    prec[st_dirty]    = committed;
+    prec[st_loop_len] = committed;
+  );
+
+  g_sysex_dirty = 1;
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+function setstate(st) instance(fpos_slope, fpos2_slope, rec) local(dt)
+(
+  rec[st_state] ? (
+    st==0 ? (
+      g_active_mask &= -1 ~ (1<<this.idx);  // -1 = all-ones; XOR clears only bit idx
+    ) : g_length > 0 ? (
+      g_firstrec = 0;
+      g_prevent_processing &= 0xe;
+      this.extra_recording = (g_pos == 0 || g_pos == g_length) ? (0|min(srate*.5, g_maxlen-g_length)) : 0;
+
+      // Phase 3: when Flex Mode is on and this is the very first recording commit
+      // (no base length exists yet), establish g_flex_base_len and store st_loop_len
+      // on the recording lane/pair.  g_flex_pos is reset to 0 so all subsequent
+      // modulo calculations start from a clean phase boundary.
+      is_flex_mode() && g_flex_base_len == 0 ? (
+        g_flex_base_len = g_length;
+        set_effective_loop_len(this.idx, g_flex_base_len);
+        g_flex_pos = 0;
+      );
+
+      // Phase 4: if this commit ends a Flex variable-length empty-lane recording,
+      // quantize the raw length, pad silence, and store st_loop_len.
+      // g_flex_rec_owner_idx == pair_owner_idx(this.idx) identifies the lane pair.
+      is_flex_mode() && g_flex_base_len > 0 &&
+          g_flex_rec_owner_idx >= 0 &&
+          g_flex_rec_owner_idx == pair_owner_idx(this.idx) ? (
+        flex_commit_empty_lane_recording(this.idx, g_flex_rec_raw_len);
+        g_flex_rec_owner_idx = -1;
+        g_flex_rec_raw_len   = 0;
+      );
+    );
+  ) : (
+    st>0 ? (
+      st == 2 && (dt = max(rec[st_dirty], this.dirty_top+1)) > 0 ? (
+        this.set_need_zero(dt);
+        this.dirty_top=-1;
+        rec[st_dirty]=0;
+      );
+
+      (g_active_mask |= (1<<this.idx)) == (1<<this.idx) ? (
+        st == 2 ? (
+          cfgp_gate[] > g_infthreshdb && cfgp_sync[] == 0 ? (
+            g_recstart_gate = 10^(cfgp_gate[]/20);
+            g_prevent_processing |= 1;
+          ) : (
+            g_prevent_processing &= 0xe;
+          );
+
+          cfgp_sync[] == 0 ? (
+            g_pos = g_offs = g_length = 0;
+            g_firstrec = 1+this.idx;
+            // Phase 3: reset flex cursor at the start of the first flex recording
+            is_flex_mode() ? g_flex_pos = 0;
+          );
+        );
+      ) : (
+        // Phase 4: second (or later) lane starting recording in Flex Mode.
+        // If Flex Mode is on, a base exists, and this lane is empty, this is a
+        // variable-length Flex recording — record the owner idx and reset the
+        // raw-length counter.  process() uses these to bypass the modulo wrap.
+        is_flex_mode() && has_flex_base() && st == 2 && rec[st_dirty] == 0 ? (
+          g_flex_rec_owner_idx = pair_owner_idx(this.idx);
+          g_flex_rec_raw_len   = 0;
+          // Buffer at linear positions 0..g_maxlen may hold stale content from
+          // a prior recording (dt==0 so set_need_zero was skipped above). Schedule
+          // a full defensive zero so process_need_zero clears each position before
+          // the advancing Flex read pointer reaches it.  Zeroing runs 8x faster
+          // than l_pos advances, so it always stays ahead of the read pointer.
+          this.set_need_zero(g_maxlen);
+        );
+      );
+    );
+  );
+  rec[st_state] = st;
+  rec[st_dirty] = max(max(rec[st_dirty],this.dirty_top+1),st==2);
+
+  st == 2 ? (
+    fpos_slope = g_slope_recin;
+    fpos2_slope = g_slope_playin;
+  ) : (
+    fpos_slope = g_slope_recout;
+    fpos2_slope = st > 0 ? g_slope_playin :
+                  (rec[st_fade_size]>0) ? -1/(rec[st_fade_size]*g_length) :
+                  g_slope_playout;
+  );
+  g_sysex_dirty = 1; // Unit 3.4: schedule a snapshot on the next @block
+);
+
 function setstate_for_rec(rec, state) (
   rec = (rec-mem_stlist)/st_num;
   <? loop(x=0;nch, printf("rec == %d ? ch%d.setstate(state) :\n",x,x+1); x+=1) ?> 0;
@@ -337,21 +517,26 @@ function setstate_pair(idx, state) local(oidx pidx) (
 
 // Save pre-overdub undo snapshot for both lanes of a pair.
 // Unit 2.1: also clears the redo stack — a new overdub discards any pending redo.
+// Phase 7: also saves st_loop_len so undo/redo can restore Flex lane lengths.
 function snapshot_pair(idx) local(oidx pidx orec prec) (
   oidx = pair_owner_idx(idx);
   pidx = pair_partner_idx(oidx);
   orec = mem_stlist + oidx * st_num;
   orec[st_state] == 1 && orec[st_dirty] > 0 && orec[st_dirty] <= g_maxlen ? (
     memcpy(orec[st_undo_buf], orec[st_buf], orec[st_dirty]);
-    orec[st_undo_len] = orec[st_dirty];
+    orec[st_undo_len]      = orec[st_dirty];
+    orec[st_undo_loop_len] = orec[st_loop_len]; // Phase 7: save Flex lane length
     orec[st_redo_len] = 0; // new overdub invalidates the redo stack
+    orec[st_redo_loop_len] = 0;
   );
   pidx >= 0 ? (
     prec = mem_stlist + pidx * st_num;
     prec[st_state] == 1 && prec[st_dirty] > 0 && prec[st_dirty] <= g_maxlen ? (
       memcpy(prec[st_undo_buf], prec[st_buf], prec[st_dirty]);
-      prec[st_undo_len] = prec[st_dirty];
-      prec[st_redo_len] = 0;
+      prec[st_undo_len]      = prec[st_dirty];
+      prec[st_undo_loop_len] = prec[st_loop_len]; // Phase 7
+      prec[st_redo_len]      = 0;
+      prec[st_redo_loop_len] = 0;
     );
   );
 );
@@ -458,7 +643,7 @@ function process_rev(buf)
 );
 
 function process(s)
-  instance(fpos, fpos2, monvol, monmode, rec, peak_in, div, l_length, l_pos)
+  instance(fpos, fpos2, monvol, monmode, rec, peak_in, div, l_length, l_pos, idx)
   local(r,wrpos,buf,l_offs, sc)
 (
   g_prevent_processing===0 ? (
@@ -469,9 +654,41 @@ function process(s)
   );
   peak_in = max(abs(s),peak_in);
 
-  l_length = g_length;
-  l_pos = g_pos;
-  l_offs = g_offs;
+  // Phase 2: use per-lane helpers so Flex Mode can supply per-lane length/position.
+  // In non-Flex Mode (g_flex_enabled==0) both helpers return g_length / g_pos unchanged.
+  // During the initial first-recording pass (g_firstrec > 0) the lane has no committed
+  // length yet, so get_lane_play_len() falls back to g_length — same as before.
+  l_length = get_lane_play_len(idx);
+  l_pos    = get_lane_play_pos(idx);
+  l_offs   = is_flex_mode() ? 0 : g_offs; // no user-offset in Flex Mode
+
+  // Phase 4: Flex variable-length empty-lane recording.
+  // When this lane is the designated Flex rec lane (g_flex_rec_owner_idx matches),
+  // override l_pos to the raw linear sample count so the write pointer never wraps.
+  // l_length is set large enough to suppress the modulo and rdc paths below.
+  // The raw-length counter advances here (inside process) so it counts every sample
+  // regardless of RDC or other adjustments.  Auto-stop at g_maxlen.
+  is_flex_mode() && pair_owner_idx(idx) == g_flex_rec_owner_idx && g_flex_rec_owner_idx >= 0 ? (
+    g_flex_rec_raw_len < g_maxlen ? (
+      // Only the pair owner increments the raw-length counter; the linked partner
+      // reads back (raw_len - 1) so both channels write to the SAME sample position.
+      // Without this guard, both channels increment per-sample → 2× count, interleaved audio.
+      idx == g_flex_rec_owner_idx ? (
+        l_pos = g_flex_rec_raw_len;
+        g_flex_rec_raw_len += 1;
+      ) : (
+        l_pos = g_flex_rec_raw_len - 1;  // owner already incremented; mirror same position
+      );
+      l_length = g_maxlen;          // suppress modulo; real length committed on stop
+    ) : (
+      // Buffer full: auto-commit by pretending the user stopped recording.
+      // The commit will happen in the next setstate call (triggered from @block or @sample).
+      // For safety, freeze the write pointer at the last valid position.
+      l_pos    = g_maxlen - 1;
+      l_length = g_maxlen;
+    );
+  );
+
   div < 1 ? (
     l_length = max((l_length*div+0.5)|0,1);
     g_firstrec === 0 ? (
@@ -563,6 +780,9 @@ function clear_pair(idx) local(oidx pidx orec prec) (
   orec[st_dirty] = 0;
   orec[st_undo_len] = 0;
   orec[st_redo_len] = 0; // Unit 2.1: clear clears both undo and redo
+  orec[st_loop_len]      = 0; // Phase 1: Flex length reset on clear
+  orec[st_undo_loop_len] = 0;
+  orec[st_redo_loop_len] = 0;
   // Clear partner when linked
   pidx >= 0 ? (
     prec = mem_stlist + pidx * st_num;
@@ -571,6 +791,9 @@ function clear_pair(idx) local(oidx pidx orec prec) (
     prec[st_dirty] = 0;
     prec[st_undo_len] = 0;
     prec[st_redo_len] = 0;
+    prec[st_loop_len]      = 0;
+    prec[st_undo_loop_len] = 0;
+    prec[st_redo_loop_len] = 0;
   );
 );
 
@@ -646,32 +869,37 @@ function xfadebuf(buf, osz, nsz) local(fsz,s,ds)
 
 function adjustsizes(scale, repup) local(nlen,olen, lp, l, offs, nlen2)
 (
-  olen = g_length;
-  nlen = (olen*scale)|0;
-  nlen >= 1 && nlen < g_maxlen ? (
-    lp=mem_stlist;
-    loop(g_nchan,
-      lp[st_dirty] ? (
-        l = max(floor(olen / lp[st_div] + 0.5),1);
-        nlen2 = max(floor(nlen / lp[st_div] + 0.5),1);
-        offs = g_offs%l;
-        nlen2 > l ? (
-          repup ? repeatbuf(lp[st_buf] + offs,l,nlen2);
-          nlen2+offs > lp[st_dirty] ? lp[st_dirty] = nlen2+offs;
-        ) : (
-          xfadebuf(lp[st_buf] + offs,l,nlen2);
+  // Phase 1 audit: adjustsizes assumes one shared g_length and rescales all lane
+  // buffers together.  In Flex Mode this would corrupt per-lane st_loop_len values,
+  // so the function is a no-op when Flex Mode is enabled.
+  !is_flex_mode() ? (
+    olen = g_length;
+    nlen = (olen*scale)|0;
+    nlen >= 1 && nlen < g_maxlen ? (
+      lp=mem_stlist;
+      loop(g_nchan,
+        lp[st_dirty] ? (
+          l = max(floor(olen / lp[st_div] + 0.5),1);
+          nlen2 = max(floor(nlen / lp[st_div] + 0.5),1);
+          offs = g_offs%l;
+          nlen2 > l ? (
+            repup ? repeatbuf(lp[st_buf] + offs,l,nlen2);
+            nlen2+offs > lp[st_dirty] ? lp[st_dirty] = nlen2+offs;
+          ) : (
+            xfadebuf(lp[st_buf] + offs,l,nlen2);
+          );
         );
+        lp += st_num;
       );
-      lp += st_num;
-    );
-    g_length = nlen;
-    g_pos %= nlen;
+      g_length = nlen;
+      g_pos %= nlen;
 
-    cfgp_sync[] ? (
-      g_slider_click_cnt = g_click_int = cfgp_clickcnt[] = ((((cfgp_clickcnt[]|0) > 0 ? cfgp_clickcnt[] : ts_num) |0)*scale)|0;
-    );
+      cfgp_sync[] ? (
+        g_slider_click_cnt = g_click_int = cfgp_clickcnt[] = ((((cfgp_clickcnt[]|0) > 0 ? cfgp_clickcnt[] : ts_num) |0)*scale)|0;
+      );
 
-    redraw_channels();
+      redraw_channels();
+    );
   );
 );
 
@@ -691,19 +919,23 @@ function undo_pair(idx) local(oidx pidx orec prec) (
   orec[st_undo_len] > 0 ? (
     // Save current state to redo buffer before overwriting.
     memcpy(orec[st_redo_buf], orec[st_buf], orec[st_undo_len]);
-    orec[st_redo_len] = orec[st_undo_len];
+    orec[st_redo_len]      = orec[st_undo_len];
+    orec[st_redo_loop_len] = orec[st_loop_len]; // Phase 7: save current Flex length to redo
     // Restore from undo snapshot.
     memcpy(orec[st_buf], orec[st_undo_buf], orec[st_undo_len]);
-    orec[st_dirty] = orec[st_undo_len];
+    orec[st_dirty]    = orec[st_undo_len];
+    orec[st_loop_len] = orec[st_undo_loop_len]; // Phase 7: restore Flex lane length
     <? loop(x=0;nch, printf("oidx == %d ? ch%d.dirty_top = orec[st_undo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
   );
   pidx >= 0 ? (
     prec = mem_stlist + pidx * st_num;
     prec[st_undo_len] > 0 ? (
       memcpy(prec[st_redo_buf], prec[st_buf], prec[st_undo_len]);
-      prec[st_redo_len] = prec[st_undo_len];
+      prec[st_redo_len]      = prec[st_undo_len];
+      prec[st_redo_loop_len] = prec[st_loop_len];
       memcpy(prec[st_buf], prec[st_undo_buf], prec[st_undo_len]);
-      prec[st_dirty] = prec[st_undo_len];
+      prec[st_dirty]    = prec[st_undo_len];
+      prec[st_loop_len] = prec[st_undo_loop_len]; // Phase 7
       <? loop(x=0;nch, printf("pidx == %d ? ch%d.dirty_top = prec[st_undo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
     );
   );
@@ -721,17 +953,21 @@ function redo_pair(idx) local(oidx pidx orec prec) (
   orec = mem_stlist + oidx * st_num;
   orec[st_redo_len] > 0 ? (
     memcpy(orec[st_buf], orec[st_redo_buf], orec[st_redo_len]);
-    orec[st_dirty] = orec[st_redo_len];
+    orec[st_dirty]    = orec[st_redo_len];
+    orec[st_loop_len] = orec[st_redo_loop_len]; // Phase 7: restore Flex lane length
     <? loop(x=0;nch, printf("oidx == %d ? ch%d.dirty_top = orec[st_redo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
-    orec[st_redo_len] = 0; // consume the redo snapshot
+    orec[st_redo_len]      = 0; // consume the redo snapshot
+    orec[st_redo_loop_len] = 0;
   );
   pidx >= 0 ? (
     prec = mem_stlist + pidx * st_num;
     prec[st_redo_len] > 0 ? (
       memcpy(prec[st_buf], prec[st_redo_buf], prec[st_redo_len]);
-      prec[st_dirty] = prec[st_redo_len];
+      prec[st_dirty]    = prec[st_redo_len];
+      prec[st_loop_len] = prec[st_redo_loop_len]; // Phase 7
       <? loop(x=0;nch, printf("pidx == %d ? ch%d.dirty_top = prec[st_redo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
-      prec[st_redo_len] = 0;
+      prec[st_redo_len]      = 0;
+      prec[st_redo_loop_len] = 0;
     );
   );
   updatechfromrec();
@@ -772,9 +1008,17 @@ function reset() local(lp)
       memset(lp[st_buf], 0, lp[st_dirty]);
       lp[st_dirty] = 0;
     );
+    lp[st_loop_len]      = 0; // Phase 1: clear Flex lane length on kill-all
+    lp[st_undo_loop_len] = 0;
+    lp[st_redo_loop_len] = 0;
     lp += st_num;
   );
   g_firstrec=g_offs=g_length=g_pos=0;
+  // Phase 1: reset Flex Mode transport state (g_flex_enabled itself is preserved)
+  g_flex_base_len      = 0;
+  g_flex_pos           = 0;
+  g_flex_rec_owner_idx = -1;
+  g_flex_rec_raw_len   = 0;
 );
 
 
@@ -823,8 +1067,9 @@ function build_sysex_snapshot()
   g_sysex_buf[4] = g_sysex_seq & 0x7F;          // seq_lo: bits 6:0
   g_sysex_buf[5] = (g_sysex_seq >> 7) & 0x7F;   // seq_hi: bits 13:7
 
-  // ── Global flags (byte 6) — bit 0 = any_active ─────────────────────────────
-  g_sysex_buf[6] = (g_active_mask != 0) ? 1 : 0;
+  // ── Global flags (byte 6) — bit 0 = any_active, bit 1 = flex_mode (Phase 9) ─
+  g_sysex_buf[6] = ((g_active_mask != 0) ? 1 : 0)
+                 | (g_flex_enabled ? 2 : 0); // bit 1: Flex Mode active
 
   // ── Selected lane (byte 7) — 0x7F = no selection ───────────────────────────
   g_sysex_buf[7] = (g_chan_selected >= 0 && g_chan_selected < g_nchan)
@@ -866,10 +1111,17 @@ function build_sysex_snapshot()
     // bits 5:4 = 0 (monmode removed in v0.2), bit 7 = 0 (7-bit MIDI safety)
 
     // Loop phase 0–127: fractional position through the loop.
-    // 0 when lane is stopped or no loop length exists yet.
-    loop_phase = (g_length > 0 && rec[st_state] != 0)
-                 ? min(127, g_pos / g_length * 127 | 0)
-                 : 0;
+    // Phase 9: In Flex Mode each lane uses its own length for phase calculation so
+    // a 4x lane and a 1x lane produce independent progress values on the NANO4.
+    // In non-Flex Mode (or when the lane has no committed length), use the shared
+    // g_pos / g_length as before.
+    is_flex_mode() && rec[st_loop_len] > 0 && rec[st_state] != 0 ? (
+      loop_phase = min(127, (g_flex_pos % rec[st_loop_len]) / rec[st_loop_len] * 127 | 0);
+    ) : (
+      loop_phase = (g_length > 0 && rec[st_state] != 0)
+                   ? min(127, g_pos / g_length * 127 | 0)
+                   : 0;
+    );
 
     g_sysex_buf[8 + i*3]     = i | ((lane_undo_redo & 0x03) << 3); // lane_info: index + undo_redo_state
     g_sysex_buf[8 + i*3 + 1] = lane_flags;
@@ -1106,6 +1358,24 @@ ext_noinit == 0 ? (
   g_length = 0;
   g_pos=0;
   g_firstrec=0;
+
+  // ── Flex Mode globals (Phase 1) ──────────────────────────────────────────────
+  // g_flex_enabled:              0 = shared-length mode (default), 1 = Flex Mode
+  // g_flex_base_len:             base quantum set by first Flex recording (samples)
+  // g_flex_pos:                  continuously-advancing master cursor (samples)
+  // g_flex_late_tolerance_smpls: recordings ending within this many samples past a
+  //                              boundary snap DOWN instead of rounding up (~150 ms)
+  g_flex_enabled              = 0;
+  g_flex_base_len             = 0;
+  g_flex_pos                  = 0;
+  g_flex_late_tolerance_smpls = (srate * 0.150 + 0.5) | 0;
+  // g_flex_rec_owner_idx: index of the lane currently doing a variable-length
+  // empty-lane Flex recording (-1 = none active).  Set on recording start,
+  // cleared on commit.  Used by process() to bypass the normal modulo wrap.
+  g_flex_rec_owner_idx        = -1;
+  // g_flex_rec_raw_len: running count of samples written into the flex rec lane.
+  g_flex_rec_raw_len          = 0;
+  // ─────────────────────────────────────────────────────────────────────────────
   g_recstart_gate=0;
   g_prevent_processing = 0; // &1=gate, &2=sync mode
   g_chan_selected = -1; // currently selected channel
@@ -1270,6 +1540,20 @@ function doconf() local(i,s) (
     );
   );
 
+  // Phase 1: Flex Mode — g_flex_enabled persists across sessions (appended, backward-compat)
+  file_avail(0) != 0 ? (
+    file_var(0, g_flex_enabled);
+  );
+
+  // Phase 1: per-lane st_loop_len persists (used to restore committed lengths after reload)
+  file_avail(0) != 0 ? (
+    i = mem_stlist;
+    loop(g_nchan,
+      file_var(0, i[st_loop_len]);
+      i += st_num;
+    );
+  );
+
   file_avail(0)>=0 ? ( // is reading config
     updatechfromrec();
     g_slider_sync = cfgp_sync[];
@@ -1278,6 +1562,22 @@ function doconf() local(i,s) (
     g_show_globals = mem_gen_cfg[23]; // restore Globals toggle from saved state
     g_show_advanced = mem_gen_cfg[24]; // restore Advanced toggle from saved state
     g_sysex_period_rate = mem_gen_cfg[29] ? 1.0 : 0; // restore Pulse toggle from saved state
+
+    // Phase 1: after loading, re-derive g_flex_base_len from the smallest non-zero
+    // st_loop_len if Flex Mode is enabled.  The base length is not stored directly;
+    // it equals the shortest committed lane length (i.e. the first-recorded lane).
+    // This ensures click generation and latch logic see a consistent base after reload.
+    g_flex_enabled ? (
+      g_flex_base_len = 0;
+      i = mem_stlist;
+      loop(g_nchan,
+        (i[st_loop_len] > 0 && (g_flex_base_len == 0 || i[st_loop_len] < g_flex_base_len)) ? (
+          g_flex_base_len = i[st_loop_len];
+        );
+        i += st_num;
+      );
+    );
+
     last_w=0;
   );
 );
@@ -1665,8 +1965,14 @@ g_prevent_processing===0 ? (
             ((g_firstrec > 0 && g_firstrec < 1 + g_nchan) ?
               mem_stlist[(g_firstrec-1)*st_num + st_div] : 1);
      );
+     // Phase 2: keep g_flex_pos shadowing g_pos during first-rec so Phase 3
+     // can read it directly to set g_flex_base_len on commit.
+     is_flex_mode() ? g_flex_pos = g_pos;
   ) : (
     (g_pos += 1) >= g_length ? g_pos=0;
+    // Phase 2: g_flex_pos advances continuously — never wraps — so modulo in
+    // get_lane_play_pos() can return each lane's own fractional position.
+    is_flex_mode() ? g_flex_pos += 1;
   );
 );
 
@@ -2061,7 +2367,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   state_x peak_x wave_x sub_x mon_x midi_x
   row_y row_cy wantr w
   g_curpk g_curpk_h gs_x gs_y gs_sz gi
-  lasthalve lastlen lastoffs lastchanlink
+  lasthalve lastlen lastoffs lastchanlink last_flex last_flex_rec
   tweaker_w tweaker_h link_area_w extra_gap content_right r_pos
   mon_sz mon_btn_x rec_x ply_x rev_x clr_x undo_x sel_x fad_x div_x rdc_x ch_x t_ypos
   lane_ypos state_hover own_rec id_text)
@@ -2071,7 +2377,9 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     lastoffs != g_offs || lastchanlink != cfgp_link[] ||
     last_show_globals != g_show_globals ||
     last_show_advanced != g_show_advanced ||
-    last_pulse != (g_sysex_period_rate > 0);
+    last_pulse != (g_sysex_period_rate > 0) ||
+    last_flex != g_flex_enabled ||         // Phase 8: redraw on Flex Mode toggle
+    last_flex_rec != g_flex_rec_owner_idx; // Phase 8: redraw during live flex recording
   lasthalve = cfgp_fade[];
   lastlen = g_length;
   lastoffs = g_offs;
@@ -2079,6 +2387,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   last_show_globals = g_show_globals;
   last_show_advanced = g_show_advanced;
   last_pulse = (g_sysex_period_rate > 0);
+  last_flex = g_flex_enabled;           // Phase 8
+  last_flex_rec = g_flex_rec_owner_idx; // Phase 8
 
   gap = 4;
   now = time_precise();
@@ -2329,6 +2639,29 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
         id_text
       );
 
+      // Phase 8: Flex Mode length-multiple label in the state area.
+      // Shows: "--" for empty lanes, "1x"/"2x"/"4x" for committed lanes,
+      // "REC→Nx" during a variable-length Flex recording (showing the target multiple).
+      is_flex_mode() ? (
+        gfx_setfont(1,"Arial",8);
+        gfx_set(0.7, 0.85, 1.0);
+        gfx_x = state_x + 2;
+        gfx_y = row_y + lane_h - 11;
+        i == g_flex_rec_owner_idx ? (
+          // Live variable-length recording: show "REC→Nx" where N is the predicted commit
+          g_flex_base_len > 0 ? (
+            gfx_printf("→%dx", max(1, ceil(g_flex_rec_raw_len / g_flex_base_len)));
+          ) : (
+            gfx_printf("REC");
+          );
+        ) : rec[st_loop_len] > 0 && g_flex_base_len > 0 ? (
+          gfx_printf("%dx", max(1, (rec[st_loop_len] / g_flex_base_len + 0.5) | 0));
+        ) : rec[st_dirty] == 0 ? (
+          gfx_printf("--");
+        );
+        gfx_setfont(0);
+      );
+
       // Waveform sub-panel — inset 2 px top/bottom so the PR contour border
       // remains visible between lanes (matching the ~4 px border on the right side).
       gfx_set(0x14/255.0, 0x14/255.0, 0x20/255.0);
@@ -2531,7 +2864,7 @@ function draw_position(ypos) local(last_pos,last_len)
   );
 );
 
-function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastclickcount, lastvclickoffs, lastoffs, lastsync, last_show_globals, last_show_advanced, last_pulse)
+function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastclickcount, lastvclickoffs, lastoffs, lastsync, last_show_globals, last_show_advanced, last_pulse, last_flex)
 (
   need_ref == 0 ? (
     need_ref = (lastlen != g_length ||
@@ -2543,7 +2876,8 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
                 lastvclickoffs != cfgp_vclick[] ||
                 last_show_globals != g_show_globals ||
                 last_show_advanced != g_show_advanced ||
-                last_pulse != (g_sysex_period_rate > 0));
+                last_pulse != (g_sysex_period_rate > 0) ||
+                last_flex != g_flex_enabled);  // Phase 8
   );
 
   need_ref ? (
@@ -2578,6 +2912,8 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
     lastsync == 0 ?  gate_button.draw_topbar_button(gfx_x+4,2,cfgp_gate[] < g_infthreshdb ? "gate: -inf dB" : sprintf(#,"gate: %.0fdB",lastgate));
 
     latch_button.draw_topbar_button(gfx_x+4,2, (lastlatch=g_latchmode) ? "latch on" : "latch off");
+    // Phase 8: Flex Mode length toggle
+    flex_button.draw_topbar_button(gfx_x+4,2, (last_flex=g_flex_enabled) ? "Flex on" : "Flex off");
     common_button.draw_topbar_button(gfx_x+4,2, (last_show_globals=g_show_globals) ? "Globals on" : "Globals off");
     advanced_button.draw_topbar_button(gfx_x+4,2, (last_show_advanced=g_show_advanced) ? "Advanced on" : "Advanced off");
     pulse_button.draw_topbar_button(gfx_x+4,2, (last_pulse=(g_sysex_period_rate>0)) ? "Pulse on" : "Pulse off");
@@ -2603,6 +2939,15 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
         mem_gen_cfg[24] = g_show_advanced;
         sliderchange(-1); // persist to @serialize
         last_w = 0;       // force full redraw to show/hide advanced controls
+      ) : flex_button.hit_topbar_button(mouse_x,mouse_y,-1) ? (
+        // Phase 8: toggle Flex Mode; reset transport state so a fresh start is clean.
+        g_flex_enabled = !g_flex_enabled;
+        g_flex_base_len = 0;
+        g_flex_pos = 0;
+        g_flex_rec_owner_idx = -1;
+        g_flex_rec_raw_len = 0;
+        sliderchange(-1); // persist g_flex_enabled via @serialize
+        last_w = 0;       // force full redraw
       ) : pulse_button.hit_topbar_button(mouse_x,mouse_y,-1) ? (
         g_sysex_period_rate = g_sysex_period_rate > 0 ? 0 : 1.0;
         mem_gen_cfg[29] = g_sysex_period_rate > 0;
