@@ -334,6 +334,48 @@ function get_lane_play_pos(idx) local(ll) (
   );
 );
 
+// Returns the playback progress of lane idx as a fraction in 0.0 ... 1.0.
+// Empty lanes (st_dirty == 0) return 0 so they never show misleading progress.
+// Non-Flex mode: all lanes track the global g_pos / g_length, matching the top bar.
+// Flex mode: each lane reports progress through its own (possibly longer) loop,
+//   so a 1x lane and a 4x lane each complete one full cycle in their own time.
+function get_lane_progress_frac(idx) local(rec lane_len lane_pos frac) (
+  rec = mem_stlist + idx * st_num;
+  rec[st_dirty] <= 0 ? (
+    frac = 0;
+  ) : (
+    lane_len = get_lane_play_len(idx);
+    lane_pos = get_lane_play_pos(idx);
+    frac = lane_len > 0 ? lane_pos / lane_len : 0;
+    frac = min(1, max(0, frac));
+  );
+  frac;
+);
+
+// Returns the waveform display length (in samples) for lane idx (ultra_redesign.md Phase 3).
+// This is the number of samples that draw_waveform() should treat as one full loop.
+// Flex mode + committed lane: use st_loop_len so longer recordings are compressed to fit.
+// Flex mode + lane still recording (st_loop_len == 0): fall back to g_length so the
+//   waveform keeps moving rather than freezing at zero.
+// Classic mode: always g_length (unchanged behaviour).
+// rec[st_div] is applied after picking the base length, preserving subdivision display.
+function get_lane_waveform_display_len(idx, rec) local(wl) (
+  wl = 0;
+  is_flex_mode() ? (
+    rec[st_loop_len] > 0 ? (
+      wl = rec[st_loop_len];
+    ) : (
+      wl = g_length;
+    );
+  ) : (
+    wl = g_length;
+  );
+  rec[st_div] > 0 && wl > 0 ? (
+    wl = floor(wl / rec[st_div] + 0.5);
+  );
+  wl;
+);
+
 // Returns the committed length multiple relative to the Flex base.
 // Returns 0 for empty lanes or when no base exists.
 function get_lane_length_multiple(idx) local(ll) (
@@ -2670,6 +2712,20 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       gfx_set(0x30/255.0, 0x30/255.0, 0x50/255.0);
       gfx_rect(wave_x, row_y + 2, 1, lane_h - 4);
 
+      // Per-lane progress fill (ultra_redesign.md Phase 1+2).
+      // Drawn after the trough background and before the waveform so the waveform
+      // renders on top.  Covers the area right of the peak meter slot.
+      // Color tracks lane state: green=playing, red=recording/overdub, dim=stopped.
+      rec[st_dirty] > 0 ? (
+        wl = floor((wave_w - 1 - peak_w) * get_lane_progress_frac(i) + 0.5);
+        wl > 0 ? (
+          rec[st_state] == 1 ? gfx_set(0x12/255.0, 0x3A/255.0, 0x12/255.0) :
+          rec[st_state] >= 2 ? gfx_set(0x3A/255.0, 0x12/255.0, 0x12/255.0) :
+                               gfx_set(0x1A/255.0, 0x1A/255.0, 0x2E/255.0);
+          gfx_rect(wave_x + 1 + peak_w, row_y + 2, wl, lane_h - 4);
+        );
+      );
+
       // Input peak meter — draw within the inset inner area
       g_curpk = max(min(log10(rec[st_peak_in] + 0.000001) * 20, 0), -68);
       g_curpk_h = ((g_curpk + 68) / 68 * (lane_h - 4))|0;
@@ -2678,9 +2734,12 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       gfx_set(0.75, 0.75, 0);
       gfx_rect(wave_x + 2, row_y + 2 + ((lane_h - 4) - g_curpk_h), peak_w, g_curpk_h);
 
-      // Waveform content
+      // Waveform content (ultra_redesign.md Phase 3: lane-specific display length).
+      // get_lane_waveform_display_len() returns st_loop_len for committed Flex lanes so
+      // longer recordings are horizontally compressed to fit the same panel width.
+      // Classic mode and uncommitted Flex lanes fall back to g_length unchanged.
       gfx_set(0.5);
-      rec[st_dirty] && (wl = floor(g_length / rec[st_div] + 0.5)) > 0 ?
+      rec[st_dirty] && (wl = get_lane_waveform_display_len(i, rec)) > 0 ?
         draw_waveform(wave_x + peak_w + gap, row_cy, wave_w - peak_w - gap*2, (lane_h-4)*0.4,
                       rec[st_buf], (g_offs % wl), wl, i);
 
