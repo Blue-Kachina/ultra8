@@ -383,6 +383,19 @@ function get_lane_length_multiple(idx) local(ll) (
     (ll / g_flex_base_len + 0.5) | 0 : 0;
 );
 
+// Re-derive g_flex_base_len from the minimum non-zero st_loop_len across all
+// lanes.  Call after any clear that may have removed the current base lane.
+function recalc_flex_base_len() local(lp) (
+  g_flex_base_len = 0;
+  lp = mem_stlist;
+  loop(g_nchan,
+    (lp[st_loop_len] > 0 && (g_flex_base_len == 0 || lp[st_loop_len] < g_flex_base_len)) ? (
+      g_flex_base_len = lp[st_loop_len];
+    );
+    lp += st_num;
+  );
+);
+
 // ── Flex Mode recording helpers (Phase 5 quantization) ───────────────────────
 
 // Quantize a raw recorded length to the nearest musical multiple of g_flex_base_len.
@@ -837,6 +850,7 @@ function clear_pair(idx) local(oidx pidx orec prec) (
     prec[st_undo_loop_len] = 0;
     prec[st_redo_loop_len] = 0;
   );
+  is_flex_mode() ? recalc_flex_base_len();
 );
 
 function onmsg(m1,m2,m3) instance(rec,note,note2,note3,note4,note5,note6,note7)
@@ -1887,9 +1901,15 @@ while (sidx == nextmsg_offs)
           // REC/PLY: recording→play; stopped/playing→record/overdub.
           g_dbg_cmn_state0 = g_cmn_rec[st_state];
           g_dbg_cmn_dirty0 = g_cmn_rec[st_dirty];
-          common_recply_pair(g_cmn_i);
-          g_dbg_cmn_state1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_state];
-          g_dbg_cmn_dirty1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_dirty];
+          // Respect latch mode: queue until next loop boundary when g_pos != 0.
+          // Queued message fires via chan_onmsg → per-lane onmsg at g_pos==0.
+          (!g_latchmode || g_pos == 0 || g_firstrec) ? (
+            common_recply_pair(g_cmn_i);
+            g_dbg_cmn_state1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_state];
+            g_dbg_cmn_dirty1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_dirty];
+          ) : (
+            latchq_add(nextmsg_1, nextmsg_2, nextmsg_3);
+          );
           strcpy(g_dbg_cmn_name, "REC/PLY");
           g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
           nextmsg_3 = 0; // suppress further dispatch
@@ -1905,9 +1925,15 @@ while (sidx == nextmsg_offs)
           // PLY/STP: recording→play; playing→stop; stopped+content→play; empty→no-op.
           g_dbg_cmn_state0 = g_cmn_rec[st_state];
           g_dbg_cmn_dirty0 = g_cmn_rec[st_dirty];
-          common_plystp_pair(g_cmn_i);
-          g_dbg_cmn_state1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_state];
-          g_dbg_cmn_dirty1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_dirty];
+          // Respect latch mode: queue until next loop boundary when g_pos != 0.
+          // Queued message fires via chan_onmsg → per-lane onmsg at g_pos==0.
+          (!g_latchmode || g_pos == 0 || g_firstrec) ? (
+            common_plystp_pair(g_cmn_i);
+            g_dbg_cmn_state1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_state];
+            g_dbg_cmn_dirty1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_dirty];
+          ) : (
+            latchq_add(nextmsg_1, nextmsg_2, nextmsg_3);
+          );
           strcpy(g_dbg_cmn_name, "PLY/STP");
           g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
           nextmsg_3 = 0; // suppress further dispatch
@@ -2032,6 +2058,21 @@ get_section('gfx');
 (gfx_w > 0) != g_prev_gfx_open ? (
   g_prev_gfx_open = (gfx_w > 0);
   g_prev_gfx_open ? (
+    // In Flex Mode: sanitize any lane whose buffer is empty but still carries
+    // a stale st_loop_len (can arise from load/clear edge cases), then
+    // re-derive g_flex_base_len so the broadcast reflects clean state.
+    is_flex_mode() ? (
+      lp = mem_stlist;
+      loop(g_nchan,
+        lp[st_dirty] == 0 ? (
+          lp[st_loop_len]      = 0;
+          lp[st_undo_loop_len] = 0;
+          lp[st_redo_loop_len] = 0;
+        );
+        lp += st_num;
+      );
+      recalc_flex_base_len();
+    );
     g_sysex_dirty  = 1;
     g_assign_dirty = 1;
   );
@@ -2431,6 +2472,11 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   last_pulse = (g_sysex_period_rate > 0);
   last_flex = g_flex_enabled;           // Phase 8
   last_flex_rec = g_flex_rec_owner_idx; // Phase 8
+  // Per-lane redraws (including the per-lane progress fills added in ultra_redesign.md)
+  // use the peak-meter 20 Hz timer (`now > rec[st_lastpkupd] + 0.05`) rather than a
+  // g_pos-driven force_redraw on every sample block.  This keeps UI CPU low while
+  // still giving fluid progress animation during playback and recording.
+  // force_redraw covers layout changes, resize, Flex-toggle, and recording transitions.
 
   gap = 4;
   now = time_precise();
@@ -2719,10 +2765,29 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       rec[st_dirty] > 0 ? (
         wl = floor((wave_w - 1 - peak_w) * get_lane_progress_frac(i) + 0.5);
         wl > 0 ? (
-          rec[st_state] == 1 ? gfx_set(0x12/255.0, 0x3A/255.0, 0x12/255.0) :
-          rec[st_state] >= 2 ? gfx_set(0x3A/255.0, 0x12/255.0, 0x12/255.0) :
-                               gfx_set(0x1A/255.0, 0x1A/255.0, 0x2E/255.0);
+          // Phase 6: boosted fill colors for legibility behind the waveform.
+          rec[st_state] == 1 ? gfx_set(0x1A/255.0, 0x4E/255.0, 0x1A/255.0) :  // playing: green
+          rec[st_state] >= 2 ? gfx_set(0x4E/255.0, 0x1A/255.0, 0x1A/255.0) :  // rec/overdub: red
+                               gfx_set(0x25/255.0, 0x25/255.0, 0x42/255.0);    // stopped: dim blue
           gfx_rect(wave_x + 1 + peak_w, row_y + 2, wl, lane_h - 4);
+        );
+      );
+
+
+      // Phase 6: Base-loop multiple tick marks.
+      // For Flex lanes longer than 1x, draw a thin vertical line at each base-loop
+      // boundary so the player can see the multiple structure at a glance.
+      // Marks sit between the progress fill and the waveform (both drawn on top).
+      is_flex_mode() && rec[st_loop_len] > 0 && g_flex_base_len > 0 ? (
+        wl = max(1, (rec[st_loop_len] / g_flex_base_len + 0.5) | 0);
+        wl > 1 ? (
+          gfx_set(0.32, 0.32, 0.56);
+          t = 1;
+          loop(wl - 1,
+            mx = wave_x + 1 + peak_w + floor((wave_w - 1 - peak_w) * t / wl + 0.5);
+            gfx_rect(mx, row_y + 2, 1, lane_h - 4);
+            t += 1;
+          );
         );
       );
 
@@ -2906,20 +2971,30 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   );
 );
 
+// ultra_redesign.md Phase 5: in Flex mode the bar now clearly labels itself as the
+// BASE/sync loop reference.  Classic mode is visually unchanged.
 function draw_position(ypos) local(last_pos,last_len)
 (
   last_w != gfx_w || last_h != gfx_h || last_pos != g_pos || last_len != g_length ? (
     last_len = g_length;
     last_pos = g_pos;
-    gfx_set(0.05, 0.05, 0.13);  // dark navy trough (§2.4)
-    gfx_rect(0,ypos,gfx_w,20);
-    gfx_set(0.10, 0.22, 0.55);  // blue playhead progress
-    g_length > 0 ? gfx_rect(0,ypos,g_pos/g_length * gfx_w,20);
-    gfx_x=2;
-    gfx_y=ypos+2;
-    gfx_set(1,1,1);
-    gfx_printf("%d mS\n%.1f BPM",g_length/srate * 1000,
-      cfgp_sync[] ? tempo : estbpm(last_len));
+    gfx_set(0.05, 0.05, 0.13);  // dark navy trough
+    gfx_rect(0, ypos, gfx_w, 20);
+    gfx_set(0.10, 0.22, 0.55);  // blue playhead fill
+    g_length > 0 ? gfx_rect(0, ypos, g_pos/g_length * gfx_w, 20);
+    gfx_x = 2;
+    gfx_y = ypos + 2;
+    is_flex_mode() ? (
+      // De-emphasise: muted text and "BASE" prefix so this bar is clearly the
+      // shared sync reference, not the progress of every lane individually.
+      gfx_set(0.55, 0.78, 0.55);
+      gfx_printf("BASE  %d mS  %.1f BPM", g_length/srate * 1000,
+        cfgp_sync[] ? tempo : estbpm(last_len));
+    ) : (
+      gfx_set(1, 1, 1);
+      gfx_printf("%d mS\n%.1f BPM", g_length/srate * 1000,
+        cfgp_sync[] ? tempo : estbpm(last_len));
+    );
   );
 );
 
