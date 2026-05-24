@@ -258,6 +258,13 @@ function pair_owner_rec(idx) (
   mem_stlist + pair_owner_idx(idx) * st_num;
 );
 
+// Returns true only for laneB (odd index) in a linked pair.
+// Overlay controls are drawn on laneB's iteration so laneA cannot be
+// overwritten by laneB panel/waveform draws that come after laneA.
+function should_draw_pair_overlay(idx) (
+  is_linked_idx(idx) && (idx & 1);
+);
+
 // Returns a pointer to the partner lane's state record, or -1 when unlinked.
 function pair_partner_rec(idx) local(p) (
   p = pair_partner_idx(idx);
@@ -2540,7 +2547,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   num_w mult_w mult_font_sz
   link_btn_w link_btn_h link_x link_cx link_cy lk_r lk_sep
   spk_hi spk_icon_sz spk_icon_x spk_icon_y
-  frac split wave_draw_w)
+  frac split wave_draw_w
+  pair_wantr mon_hit_y mon_hit_h mon_hit_rec)
 (
   // ── Ultra8 Design Palette ─────────────────────────────────────────────────────
   C_BG_BASE        = 0x13171C;   // overall background
@@ -2841,6 +2849,19 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
         lane_h / pr_s * 100
       );
 
+      // Linked pair: erase the shared edge so the two lanes don't show a double-thick border.
+      // laneA erases its own bottom 2px; laneB erases its own top 2px.
+      // Both happen in the wantr block; the laneA→laneB sync (line 2831) ensures they
+      // redraw together so neither half of the seam is left behind.
+      is_linked_idx(i) ? (
+        set_color(C_BG_BASE);
+        !(i & 1) ? (
+          gfx_rect(state_x, row_y + lane_h - 2, content_right - state_x, 2); // laneA: erase bottom border
+        ) : (
+          gfx_rect(state_x, row_y, content_right - state_x, 2);               // laneB: erase top border
+        );
+      );
+
       // State area fill: full state_w gets the dark lane color.
       rec[st_state] >= 2 ? set_color(C_LANE_REC) :
       rec[st_state] == 1 ? set_color(C_LANE_PLAY) :
@@ -2998,8 +3019,9 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     // Sub-controls: CH, REC/PLY, PLY/STP, REV, UNDO, CLR, advanced SEL/RDC/DIV/FAD, MON, speaker
     t = mem_stlist + i * st_num;
     t_ypos = row_cy - (tweaker_h / 2)|0;
-    // Partner lane in a linked pair: tweakers completely hidden; Lane A tweakers drop to Lane B centre.
-    !(is_linked_idx(i) && (i & 1)) ? (
+
+    // Unlinked lane: draw controls at this lane's vertical centre.
+    !is_linked_idx(i) ? (
       ch_x >= 0 ? draw_value_tweaker(ch_x, t_ypos, t + st_midichan, wantr, "CH");
       rec_x >= 0 ? draw_value_tweaker(rec_x, t_ypos, t + st_note1, wantr,
               rec[st_state]==2 && !g_firstrec ? "PLY" : "REC");
@@ -3020,14 +3042,86 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       mon_btn_x >= 0 ? draw_value_tweaker(mon_btn_x, t_ypos, t + st_note7, wantr, "MON");
     );
 
-    // Monitor right-click: cycle 3 modes
-    ((mouse_cap&1) && !(last_mouse_cap&1) || (mouse_cap&2) && !(last_mouse_cap&2)) && !cap_mode &&
-        mouse_in(mon_x, row_y, mon_sz, lane_h) ? (
-      rec[st_monmode] = (rec[st_monmode]+1)%3;
-      rec2 = get_linked_rec(i);
-      rec2 >= 0 ? rec2[st_monmode] = rec[st_monmode];
-      updatechfromrec();
-      sliderchange(-1);
+    // Linked laneA: no controls drawn here — they are drawn during laneB's iteration
+    // so laneB panel/waveform draws cannot overwrite them.
+
+    // Linked pair overlay: draw laneA controls centered on the pair boundary, only during laneB.
+    // Uses rec2 for laneA record; pair_wantr = wantr (laneA sync guaranteed by line 2823).
+    should_draw_pair_overlay(i) ? (
+      t = mem_stlist + (i - 1) * st_num;   // laneA mem slot
+      rec2 = rec - st_num;                 // laneA record
+      t_ypos = row_y - (tweaker_h / 2)|0;  // centered on pair boundary
+      pair_wantr = wantr;
+
+      ch_x >= 0 ? draw_value_tweaker(ch_x, t_ypos, t + st_midichan, pair_wantr, "CH");
+      rec_x >= 0 ? draw_value_tweaker(rec_x, t_ypos, t + st_note1, pair_wantr,
+              rec2[st_state]==2 && !g_firstrec ? "PLY" : "REC");
+      ply_x >= 0 ? draw_value_tweaker(ply_x, t_ypos, t + st_note2, pair_wantr,
+              rec2[st_state]==1 ? "STP" : "PLY");
+      rev_x >= 0 ? draw_value_tweaker(rev_x, t_ypos, t + st_note4, pair_wantr, "REV");
+      undo_x >= 0 ? draw_value_tweaker(undo_x, t_ypos, t + st_note6, pair_wantr,
+              t[st_redo_len] > 0 ? "REDO" : "UNDO");
+      clr_x >= 0 ? draw_value_tweaker(clr_x, t_ypos, t + st_note5, pair_wantr, "CLR");
+
+      g_show_advanced ? (
+        sel_x >= 0 ? draw_value_tweaker(sel_x, t_ypos, t + st_note3, pair_wantr, "SEL");
+        rdc_x >= 0 ? draw_value_tweaker(rdc_x, t_ypos, t + st_rdc, pair_wantr, "RDC");
+        div_x >= 0 ? draw_value_tweaker(div_x, t_ypos, t + st_div, pair_wantr, "DIV");
+        fad_x >= 0 ? draw_value_tweaker(fad_x, t_ypos, t + st_fade_size, pair_wantr, "FAD");
+      );
+
+      mon_btn_x >= 0 ? draw_value_tweaker(mon_btn_x, t_ypos, t + st_note7, pair_wantr, "MON");
+
+      // Phase 6: draw laneA monitor icon at boundary (moved out of link-button block)
+      pair_wantr ? (
+        mx = mon_x;
+        my = row_y - (mon_sz/2)|0;
+        rec2[st_monmode] > 0 ? (
+          rec2[st_state] >= 2 ? set_color(C_LANE_REC) :
+          rec2[st_state] == 1 ? set_color(C_LANE_PLAY) :
+                               set_color(C_LANE_STOP_CONT);
+          gfx_rect(mx, my, mon_sz, mon_sz);
+          rec2[st_state] >= 2 ? set_color(C_MON_REC_FG) :
+          rec2[st_state] == 1 ? set_color(C_MON_PLAY_FG) :
+                               set_color(C_MON_STOP_FG);
+        ) : (
+          set_color(C_MON_OFF_BG);
+          gfx_rect(mx, my, mon_sz, mon_sz);
+          set_color(C_MON_OFF_FG);
+        );
+        gfx_rect(mx, my, mon_sz, 1);
+        gfx_rect(mx, my+mon_sz-1, mon_sz, 1);
+        gfx_rect(mx, my, 1, mon_sz);
+        gfx_rect(mx+mon_sz-1, my, 1, mon_sz);
+        spk_icon_sz = mon_sz * 0.5;
+        spk_icon_x = mx + (mon_sz - spk_icon_sz) * 0.5;
+        spk_icon_y = my + (mon_sz - spk_icon_sz) * 0.5;
+        draw_speaker_clean(spk_icon_x, spk_icon_y, spk_icon_sz, spk_icon_sz);
+      );
+    );
+
+    // Monitor hit test — Phase 7: outer guard suppresses linked laneA entirely.
+    // Without it, neither branch would fire for linked laneA, leaving mon_hit_*
+    // stale from the previous lane and risking a spurious click.
+    (!is_linked_idx(i) || (i & 1)) ? (
+      !is_linked_idx(i) ? (
+        mon_hit_y   = row_y;
+        mon_hit_h   = lane_h;
+        mon_hit_rec = rec;
+      ) : (
+        // linked laneB: icon sits on the pair boundary
+        mon_hit_y   = row_y - (mon_sz / 2)|0;
+        mon_hit_h   = mon_sz;
+        mon_hit_rec = rec - st_num;
+      );
+      ((mouse_cap&1) && !(last_mouse_cap&1) || (mouse_cap&2) && !(last_mouse_cap&2)) && !cap_mode &&
+          mouse_in(mon_x, mon_hit_y, mon_sz, mon_hit_h) ? (
+        mon_hit_rec[st_monmode] = (mon_hit_rec[st_monmode] + 1) % 3;
+        rec2 = get_linked_rec(i);
+        rec2 >= 0 ? rec2[st_monmode] = mon_hit_rec[st_monmode];
+        updatechfromrec();
+        sliderchange(-1);
+      );
     );
 
     // Link button: chain-link icon, centered in state_w, straddling pair boundary
@@ -3063,35 +3157,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
         set_color(C_BG_BASE);
         gfx_rect((link_cx - 2)|0, (link_cy - 1)|0, 5, 3);
       );
-      // Linked pair: draw Lane A's monitor at the boundary, on top of both backgrounds.
-      // Uses rec - st_num to read Lane A's state. Mirrors Lane B's wantr so redraws
-      // are synchronised with the rest of the pair's redraw cycle.
-      t ? (
-        rec_a = rec - st_num;
-        mx = mon_x;
-        my = row_y - (mon_sz/2)|0;
-        rec_a[st_monmode] > 0 ? (
-          rec_a[st_state] >= 2 ? set_color(C_LANE_REC) :
-          rec_a[st_state] == 1 ? set_color(C_LANE_PLAY) :
-                                 set_color(C_LANE_STOP_CONT);
-          gfx_rect(mx, my, mon_sz, mon_sz);
-          rec_a[st_state] >= 2 ? set_color(C_MON_REC_FG) :
-          rec_a[st_state] == 1 ? set_color(C_MON_PLAY_FG) :
-                                 set_color(C_MON_STOP_FG);
-        ) : (
-          set_color(C_MON_OFF_BG);
-          gfx_rect(mx, my, mon_sz, mon_sz);
-          set_color(C_MON_OFF_FG);
-        );
-        gfx_rect(mx, my, mon_sz, 1);
-        gfx_rect(mx, my+mon_sz-1, mon_sz, 1);
-        gfx_rect(mx, my, 1, mon_sz);
-        gfx_rect(mx+mon_sz-1, my, 1, mon_sz);
-        spk_icon_sz = mon_sz * 0.5;
-        spk_icon_x = mx + (mon_sz - spk_icon_sz) * 0.5;
-        spk_icon_y = my + (mon_sz - spk_icon_sz) * 0.5;
-        draw_speaker_clean(spk_icon_x, spk_icon_y, spk_icon_sz, spk_icon_sz);
-      );
+      // Monitor icon for linked pair is now drawn in the pair overlay block above (Phase 6).
     );
 
     i += 1;
