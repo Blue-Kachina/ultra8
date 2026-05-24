@@ -2112,6 +2112,7 @@ get_section('gfx');
     );
     g_sysex_dirty  = 1;
     g_assign_dirty = 1;
+    last_w = 0;  // force full UI redraw on window open (framebuffer reset)
   );
 );
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2815,6 +2816,11 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       rec[st_lastd] = mode;
       rec[st_lastpkupd] = now;
       wantr = 1;
+
+      // Linked pair sync: when Lane A fires wantr, zero Lane B's timer so it
+      // fires in the same @gfx frame.  This keeps the boundary monitor icon
+      // and the selected-lane blue outline redrawn atomically.
+      !(i&1) && (cfgp_link[] & (1<<(i>>1))) ? (rec+st_num)[st_lastpkupd] = 0;
 
       // Lane container panel (full width minus link area, colored by state)
       // State 2 = recording: vivid red so it's unmistakable vs stopped/playing.
@@ -3554,7 +3560,7 @@ function export()  local(rec, flag, tidx, idx, ster, l)
   g_length > 0 ? loop(g_nchan,
     !(idx&1) || get_linked_rec(idx)<0 ? (
       ster = get_linked_rec(idx);
-      rec[st_state] ? (
+      rec[st_dirty] > 0 ? (
         l = (g_length / rec[st_div])|0;
         export_buffer_to_project(rec[st_buf]+g_offs%l,l, ster>=0 ? 2 : 1,srate,tidx, flag,
           flag?(cfgp_sync[] ? tempo : estbpm(g_length)),
