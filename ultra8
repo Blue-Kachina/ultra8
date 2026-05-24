@@ -1364,15 +1364,15 @@ ext_noinit == 0 ? (
 
   mem_gen_names = alloc(mem_gen_sz);
   memset(mem_gen_names,"",mem_gen_sz);
-  mem_gen_names[0] = "kill";
-  mem_gen_names[1] = "halve";
-  mem_gen_names[2] = "double";
-  mem_gen_names[3] = "double\nno rep";
-  mem_gen_names[4] = "init\nrec\ngate";
-  mem_gen_names[7] = "add to\nproject";
-  mem_gen_names[11] = "x-fade\nshortened\nloop";
-  mem_gen_names[14] = "play all";
-  mem_gen_names[15] = "rec/play\nselected";
+  mem_gen_names[0] = "KILL";
+  mem_gen_names[1] = "HALVE";
+  mem_gen_names[2] = "DOUBLE";
+  mem_gen_names[3] = "DOUBLE\nNO REP";
+  mem_gen_names[4] = "INIT\nREC\nGATE";
+  mem_gen_names[7] = "ADD TO\nPROJECT";
+  mem_gen_names[11] = "X-FADE\nSHORTENED\nLOOP";
+  mem_gen_names[14] = "PLAY ALL";
+  mem_gen_names[15] = "REC/PLAY\nSELECTED";
 
   mem_gen_order = alloc(9);
   mem_gen_order[0]=1;
@@ -1397,7 +1397,7 @@ ext_noinit == 0 ? (
   g_lane_mon_req = 0;
   g_mon_changed = 0;  // flag: monmode changed in @sample, sliderchange needed from @gfx
   g_msg_chan = 1;     // last received MIDI channel (1-16)
-  g_global_monmode = 1; // state used by the global speaker icon cycle
+  g_global_monmode = 0; // state used by the global speaker icon; 0=off, 2=always-on
 
   // Debug telemetry — updated in @sample on every common-mode dispatch, read in @gfx.
   g_dbg_cmn_name  = "";   // name of last common action ("REC/PLY", "PLY/STP", "MON", …)
@@ -2234,9 +2234,9 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
   );
   draw ? (
     t=midimem[0];
-    gfx_set(.35);
-    gfx_setfont(1,"Arial",13);
-    gfx_rect(xpos,ypos,w,42);
+    gfx_set(0.18, 0.18, 0.25);
+    gfx_setfont(1, "Arial", 13);
+    gfx_rect(xpos, ypos, w, 42);
     lbl == "RDC" ? (
       do_overlay=0;
       t=floor(t*10)*.1;
@@ -2265,13 +2265,13 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
     gfx_measurestr(t,tw,th);
     gfx_y=ypos + min((lbl?(40-th):(42-th)*.5) + do_overlay, 42-th);
     gfx_x=xpos + (w-tw)*.5;
-    gfx_set(0.1);
+    gfx_set(0.9, 0.9, 1.0);
     gfx_drawstr(t);
     lbl ? (
-      gfx_set(.5);
-      gfx_measurestr(lbl,tw,th);
-      gfx_x=xpos+(w-tw)*.5;
-      gfx_y=ypos+2;
+      gfx_set(0.55, 0.55, 0.65);
+      gfx_measurestr(lbl, tw, th);
+      gfx_x = xpos + (w - tw) * 0.5;
+      gfx_y = ypos + 2;
       gfx_drawstr(lbl);
     );
     gfx_setfont(0);
@@ -2362,6 +2362,47 @@ function draw_waveform(xpos,ycent,w,amp,start_offs,bptr,srclen,chan_idx)
   );
 );
 
+function draw_speaker_clean(xpos, ypos, w, h)
+  local(bx by bw bh hx1 hx2 htop1 hbot1 htop2 hbot2 angle da r1 r2 sx sy arc_steps)
+(
+  // Speaker body: filled rect (left ~28%)
+  bw = w * 0.28;
+  bh = h * 0.40;
+  bx = xpos + w * 0.06;
+  by = ypos + (h - bh) * 0.5;
+  gfx_rect(bx|0, by|0, bw|0, bh|0);
+
+  // Horn: filled trapezoid via two triangles (wider toward right)
+  hx1 = (bx + bw)|0;
+  htop1 = by|0;
+  hbot1 = (by + bh)|0;
+  hx2 = (xpos + w * 0.58)|0;
+  htop2 = (ypos + h * 0.08)|0;
+  hbot2 = (ypos + h * 0.92)|0;
+  gfx_triangle(hx1, htop1, hx2, htop2, hx2, hbot2);
+  gfx_triangle(hx1, htop1, hx1, hbot1, hx2, hbot2);
+
+  // Sound arcs: two arcs, double-thick lines
+  r1 = w * 0.14;
+  r2 = w * 0.24;
+  arc_steps = 9;
+  da = $pi * 0.60 / arc_steps;
+  sx = xpos + w * 0.68;
+  sy = ypos + h * 0.5;
+  angle = -$pi * 0.30;
+  loop(arc_steps,
+    gfx_line(sx + r1*cos(angle),       sy + r1*sin(angle),
+             sx + r1*cos(angle+da),     sy + r1*sin(angle+da), 0);
+    gfx_line(sx + (r1+1)*cos(angle),   sy + (r1+1)*sin(angle),
+             sx + (r1+1)*cos(angle+da), sy + (r1+1)*sin(angle+da), 0);
+    gfx_line(sx + r2*cos(angle),       sy + r2*sin(angle),
+             sx + r2*cos(angle+da),     sy + r2*sin(angle+da), 0);
+    gfx_line(sx + (r2+1)*cos(angle),   sy + (r2+1)*sin(angle),
+             sx + (r2+1)*cos(angle+da), sy + (r2+1)*sin(angle+da), 0);
+    angle += da;
+  );
+);
+
 function draw_topbar_button(xp, yp, str)
   instance(w,h,x,y)
   globals(gfx_x,gfx_y)
@@ -2442,6 +2483,10 @@ function load_file(filename, channel) local(fh nch sr len rec rec2 buf buf2 v i)
   );
 );
 
+function set_color(c) (
+  gfx_set((c >> 16 & 0xFF) / 255.0, (c >> 8 & 0xFF) / 255.0, (c & 0xFF) / 255.0);
+);
+
 function draw(ixpos, ypos) local(i gap rec mode force_redraw
   mx my mw t lx ty tw th rec2 wl
   now dropfile last_show_globals last_show_advanced last_pulse tx
@@ -2453,8 +2498,46 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   lasthalve lastlen lastoffs lastchanlink last_flex last_flex_rec
   tweaker_w tweaker_h link_area_w extra_gap content_right r_pos
   mon_sz mon_btn_x rec_x ply_x rev_x clr_x undo_x sel_x fad_x div_x rdc_x ch_x t_ypos
-  lane_ypos state_hover own_rec id_text)
+  lane_ypos state_hover own_rec id_text
+  num_w mult_w mult_font_sz
+  link_btn_w link_btn_h link_x link_cx link_cy lk_r lk_sep
+  spk_hi spk_icon_sz spk_icon_x spk_icon_y
+  frac split wave_draw_w)
 (
+  // ── Ultra8 Design Palette ─────────────────────────────────────────────────────
+  C_BG_BASE        = 0x13171C;   // overall background
+  C_BG_TOPBAR      = 0x13171C;   // top bar background
+  C_LANE_REC       = 0x2B1415;   // recording/overdub: dark red
+  C_LANE_PLAY      = 0x152116;   // playing: dark green
+  C_LANE_STOP_CONT = 0x13171C;   // stopped with content: main UI
+  C_LANE_EMPTY     = 0x13171C;   // empty lane: main UI
+  C_CONT_REC       = 0x44191B;   // recording highlight
+  C_CONT_PLAY      = 0x1F341C;   // playback highlight
+  C_CONT_STOP      = 0x1D242C;   // stopped contour: main UI highlight
+  C_CONT_SEL       = 0x7080E0;   // selected contour
+  C_WAVE_TROUGH    = 0x0E0E1E;   // waveform sub-panel bg
+  C_WAVE_PLAYED    = 0xCCCCCC;   // played: near-white
+  C_WAVE_UNPLAYED  = 0x404060;   // unplayed: dim blue-grey
+  C_PROG_PLAY      = 0x1F341C;   // playing progress fill (playback highlight)
+  C_PROG_REC       = 0x44191B;   // recording progress fill (recording highlight)
+  C_PROG_STOP      = 0x1D242C;   // stopped progress fill (main UI highlight)
+  C_MON_OFF_BG  = 0x0C0C12;   // monitor off: near-black bg
+  C_MON_OFF_FG  = 0x2A2A3C;   // monitor off: barely-visible border + icon
+  C_MON_REC_FG  = 0xD83535;   // monitor on + recording: vivid red
+  C_MON_PLAY_FG = 0x35D050;   // monitor on + playing: vivid green
+  C_MON_STOP_FG = 0x3878C0;   // monitor on + stopped: vivid blue
+  C_LINK_ON_BG     = 0x1A3A6A;   // linked fill
+  C_LINK_ON_FG     = 0x88BBFF;   // linked icon
+  C_LINK_OFF_BG    = 0x141420;   // unlinked bg
+  C_LINK_OFF_FG    = 0x3A3A58;   // unlinked icon
+  C_MULT_LABEL     = 0xDDEEFF;   // multiplier text active
+  C_MULT_INACTIVE  = 0x3A3A50;   // multiplier text empty
+  C_PILL_ON_DOT    = 0x30DD80;   // topbar ON dot
+  C_PILL_OFF_DOT   = 0x404050;   // topbar OFF dot
+  C_PILL_LABEL     = 0x909090;   // topbar label text
+  C_PILL_VALUE     = 0xFFFFFF;   // topbar value text
+  // ────────────────────────────────────────────────────────────────────────────
+
   force_redraw = gfx_w != last_w || gfx_h != last_h ||
     lasthalve != cfgp_fade[] || lastlen != g_length ||
     lastoffs != g_offs || lastchanlink != cfgp_link[] ||
@@ -2478,7 +2561,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   // still giving fluid progress animation during playback and recording.
   // force_redraw covers layout changes, resize, Flex-toggle, and recording transitions.
 
-  gap = 4;
+  gap = 5;
   now = time_precise();
   pr_s = min(gfx_w, gfx_h);
   pr_s < 1 ? pr_s = 1;
@@ -2501,13 +2584,16 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
 
   tweaker_w    = 45;
   tweaker_h    = 42;
-  link_area_w  = 25;
+  link_btn_w   = 26;   // link button width
+  link_btn_h   = 30;   // link button height
   extra_gap    = 10;
 
-  state_w = max((gfx_w * 0.06)|0, 46);
-  peak_w  = 7;
+  num_w   = 40;           // lane number column
+  mult_w  = 52;           // multiplier label column
+  state_w = num_w + mult_w;
+  peak_w  = 5;
   state_x = ixpos;
-  content_right = gfx_w - link_area_w;
+  content_right = gfx_w;
 
   mon_sz = min(tweaker_h, max(lane_h - 6, 16));
 
@@ -2515,31 +2601,33 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   mon_x = r_pos - mon_sz;
   r_pos = mon_x - gap;
 
-  mon_btn_x = r_pos - tweaker_w;
-  r_pos = mon_btn_x - extra_gap;
-
   g_show_advanced ? (
+    // SHOW CONTROLS ON: compute all tweaker positions right-to-left
     gfx_w > 900 ? ( fad_x = r_pos - tweaker_w; r_pos = fad_x - gap; ) : fad_x = -1;
     gfx_w > 820 ? ( div_x = r_pos - tweaker_w; r_pos = div_x - gap; ) : div_x = -1;
     gfx_w > 740 ? ( rdc_x = r_pos - tweaker_w; r_pos = rdc_x - gap; ) : rdc_x = -1;
     sel_x = r_pos - tweaker_w;
     r_pos = sel_x - extra_gap;
+    clr_x = r_pos - tweaker_w;
+    r_pos = clr_x - gap;
+    undo_x = r_pos - tweaker_w;
+    r_pos = undo_x - gap;
+    rev_x = r_pos - tweaker_w;
+    r_pos = rev_x - gap;
+    ply_x = r_pos - tweaker_w;
+    r_pos = ply_x - gap;
+    rec_x = r_pos - tweaker_w;
+    r_pos = rec_x - extra_gap;
+    ch_x = r_pos - tweaker_w;
+    r_pos = ch_x - gap;
+    mon_btn_x = r_pos - tweaker_w;
+    r_pos = mon_btn_x - extra_gap;
   ) : (
+    // SHOW CONTROLS OFF: hide all tweakers; waveform expands
     fad_x = -1; div_x = -1; rdc_x = -1; sel_x = -1;
+    clr_x = -1; undo_x = -1; rev_x = -1; ply_x = -1;
+    rec_x = -1; ch_x = -1; mon_btn_x = -1;
   );
-
-  clr_x = r_pos - tweaker_w;
-  r_pos = clr_x - gap;
-  undo_x = r_pos - tweaker_w;
-  r_pos = undo_x - gap;
-  rev_x = r_pos - tweaker_w;
-  r_pos = rev_x - gap;
-  ply_x = r_pos - tweaker_w;
-  r_pos = ply_x - gap;
-  rec_x = r_pos - tweaker_w;
-  r_pos = rec_x - extra_gap;
-  ch_x = r_pos - tweaker_w;
-  r_pos = ch_x - gap;
 
   wave_x = state_x + state_w;
   wave_w = max(r_pos - wave_x - gap, 30);
@@ -2548,8 +2636,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   g_show_globals ? (
     force_redraw ? (
       // Overall strip background
-      PR.Color.Panel = "201A40FF";
-      PR.Color.Contour = "403060FF";
+      PR.Color.Panel = "181030FF";
+      PR.Color.Contour = "302050FF";
       PR.DisplayPanel(
         (ixpos + (gfx_w - ixpos) * 0.5) / pr_s * 100,
         (ypos + 27) / pr_s * 100,
@@ -2575,26 +2663,36 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
 
     mon_btn_x >= 0 ? draw_global_tweaker(mon_btn_x, ypos+6, cfgp_common_mon,  st_note7, force_redraw, "MON");
 
-    // Global speaker icon: mouse-click cycles all lanes through the three speaker states.
+    // Global monitor speaker button: 2-state (0=off, 2=always-on). Styled like per-lane.
     gs_x = mon_x; gs_y = ypos + 6; gs_sz = mon_sz;
     force_redraw ? (
-      g_global_monmode == 0 ? gfx_set(0.2) :
-      g_global_monmode == 1 ? gfx_set(0.3,0.3,0.7) :
-                              gfx_set(0.9,0.8,0);
-      gfx_rect(gs_x, gs_y, gs_sz, gs_sz);
-
-      g_global_monmode == 0 ? gfx_set(0) :
-      g_global_monmode == 2 ? gfx_set(1,1,1,1) : gfx_set(1,1,1,.25);
-      draw_speaker(gs_x + gs_sz/2, gs_y + gs_sz/2, gs_sz/2);
-
-      g_global_monmode == 0 ? (
-        gfx_set(0);
-        gfx_line(gs_x, gs_y, gs_x+gs_sz, gs_y+gs_sz);
-        gfx_line(gs_x+gs_sz, gs_y, gs_x, gs_y+gs_sz);
+      g_global_monmode == 2 ? (
+        // Always-on: vivid blue border + icon (mirrors per-lane "on" style)
+        set_color(C_MON_OFF_BG);
+        gfx_rect(gs_x, gs_y, gs_sz, gs_sz);
+        set_color(C_MON_STOP_FG);
+        gfx_rect(gs_x, gs_y, gs_sz, 1);
+        gfx_rect(gs_x, gs_y+gs_sz-1, gs_sz, 1);
+        gfx_rect(gs_x, gs_y, 1, gs_sz);
+        gfx_rect(gs_x+gs_sz-1, gs_y, 1, gs_sz);
+      ) : (
+        // Off: near-black bg, barely-visible border + icon (mirrors per-lane "off" style)
+        set_color(C_MON_OFF_BG);
+        gfx_rect(gs_x, gs_y, gs_sz, gs_sz);
+        set_color(C_MON_OFF_FG);
+        gfx_rect(gs_x, gs_y, gs_sz, 1);
+        gfx_rect(gs_x, gs_y+gs_sz-1, gs_sz, 1);
+        gfx_rect(gs_x, gs_y, 1, gs_sz);
+        gfx_rect(gs_x+gs_sz-1, gs_y, 1, gs_sz);
       );
+      spk_icon_sz = gs_sz * 0.5;
+      spk_icon_x = gs_x + (gs_sz - spk_icon_sz) * 0.5;
+      spk_icon_y = gs_y + (gs_sz - spk_icon_sz) * 0.5;
+      draw_speaker_clean(spk_icon_x, spk_icon_y, spk_icon_sz, spk_icon_sz);
     );
     (mouse_cap&1) && !(last_mouse_cap&1) && !cap_mode && mouse_in(gs_x, gs_y, gs_sz, gs_sz) ? (
-      g_global_monmode = (g_global_monmode + 1) % 3;
+      // 2-state toggle: off (0) ↔ always-on (2); never lands on auto/selected (1)
+      g_global_monmode = g_global_monmode == 2 ? 0 : 2;
       gi = mem_stlist;
       loop(g_nchan,
         gi[st_monmode] = g_global_monmode;
@@ -2645,8 +2743,9 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     dropfile && mouse_in(state_x, row_y, gfx_w - 16, lane_h) ? load_file(dropfile, i);
 
     !cap_mode && (mouse_cap&1) && !(last_mouse_cap&1) ? (
-      // Link button hit zone: right 22px, spanning both lanes of a pair
-      (i&1) && mouse_in(gfx_w - 25, row_y - lane_h, 25, lane_h*2) ? (
+      // Link button hit zone: centered in state_w, straddling pair boundary
+      link_x = state_x + ((state_w - link_btn_w) * 0.5)|0;
+      (i&1) && mouse_in(link_x, row_y - link_btn_h/2, link_btn_w, link_btn_h) ? (
         cfgp_link[] ~= 1<<(i>>1);
         // Phase 3: when just linked, normalize partner state from owner
         cfgp_link[] & (1<<(i>>1)) ? (
@@ -2664,7 +2763,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       ) : mouse_in(state_x, row_y, state_w, lane_h) ? (
         // Lane identifier click: inject PLY/STP toggle for the pair owner
         g_inject_midinote = 1024 + pair_owner_rec(i) + st_note2;
-      ) : mouse_in(state_x + state_w, row_y, gfx_w - 22 - state_w, lane_h) ? (
+      ) : mouse_in(state_x + state_w, row_y, gfx_w - state_w, lane_h) ? (
         select_pair(i);
       );
     );
@@ -2685,14 +2784,13 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       // State 1 = playing:   visible green.
       // Dirty   = stopped with content: dim blue-violet.
       // Empty   = off: very dark.
-      rec[st_state] == 2 ? PR.Color.Panel = "6A1A1AFF" :
-      rec[st_state] == 1 ? PR.Color.Panel = "1A4A1AFF" :
-      rec[st_dirty]      ? PR.Color.Panel = "2A2A40FF" :
-                           PR.Color.Panel = "252530FF";
-      rec[st_state] == 2 ? PR.Color.Contour = "C04040FF" :
-      rec[st_state] == 1 ? PR.Color.Contour = "40C040FF" :
-                           PR.Color.Contour = "5060A0FF";
-      (mode&8) ? PR.Color.Contour = "8090E0FF";
+      rec[st_state] >= 2 ? PR.Color.Panel = "2B1415FF" :
+      rec[st_state] == 1 ? PR.Color.Panel = "152116FF" :
+                           PR.Color.Panel = "13171CFF";
+      rec[st_state] >= 2 ? PR.Color.Contour = "44191BFF" :
+      rec[st_state] == 1 ? PR.Color.Contour = "1F341CFF" :
+                           PR.Color.Contour = "1D242CFF";
+      (mode&8) ? PR.Color.Contour = "7080E0FF";
       PR.DisplayPanel(
         (state_x + (content_right - state_x) * 0.5) / pr_s * 100,
         (row_y + lane_h * 0.5) / pr_s * 100,
@@ -2700,14 +2798,22 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
         lane_h / pr_s * 100
       );
 
-      // State area fill: explicit raw rect painted after the PR panel so any
-      // floating-point rounding in PR.DisplayPanel can't leave a gap at wave_x.
-      // Covers from inside the left contour border (x+2) to exactly wave_x.
-      rec[st_state] == 2 ? gfx_set(0x6A/255.0, 0x1A/255.0, 0x1A/255.0) :
-      rec[st_state] == 1 ? gfx_set(0x1A/255.0, 0x4A/255.0, 0x1A/255.0) :
-      rec[st_dirty]      ? gfx_set(0x2A/255.0, 0x2A/255.0, 0x40/255.0) :
-                           gfx_set(0x25/255.0, 0x25/255.0, 0x30/255.0);
+      // State area fill: full state_w gets the dark lane color.
+      rec[st_state] >= 2 ? set_color(C_LANE_REC) :
+      rec[st_state] == 1 ? set_color(C_LANE_PLAY) :
+                           set_color(C_LANE_STOP_CONT);
       gfx_rect(state_x + 2, row_y + 2, state_w - 2, lane_h - 4);
+      // Lane number box: highlight-color border (top/bottom/right edges)
+      rec[st_state] >= 2 ? set_color(C_CONT_REC) :
+      rec[st_state] == 1 ? set_color(C_CONT_PLAY) :
+                           set_color(C_CONT_STOP);
+      gfx_rect(state_x + 2, row_y + 2, num_w - 3, 1);          // top
+      gfx_rect(state_x + 2, row_y + lane_h - 5, num_w - 3, 1); // bottom
+      gfx_rect(state_x + num_w - 2, row_y + 2, 1, lane_h - 6); // right
+      // Multiplier box border (same highlight color, 1px outline)
+      gfx_rect(state_x + num_w, row_y + 3, 1, lane_h - 6);           // left edge
+      gfx_rect(state_x + num_w + 1, row_y + 2, mult_w - 3, 1);       // top edge
+      gfx_rect(state_x + num_w + 1, row_y + lane_h - 5, mult_w - 3, 1); // bottom edge
 
       // Lane number / hover play-stop symbol (left portion of container)
       PR.Color.Text = "FFFFFFFF";
@@ -2721,41 +2827,45 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
         id_text = sprintf(#, "%d", i+1);
       );
       PR.DisplayText(
-        (state_x + state_w*0.5) / pr_s * 100,
-        (row_y + lane_h*0.5) / pr_s * 100,
+        (state_x + num_w * 0.5) / pr_s * 100,
+        (row_y + lane_h * 0.5) / pr_s * 100,
         3.5,
         id_text
       );
 
-      // Phase 8: Flex Mode length-multiple label in the state area.
-      // Shows: "--" for empty lanes, "1x"/"2x"/"4x" for committed lanes,
-      // "REC→Nx" during a variable-length Flex recording (showing the target multiple).
+      // Multiplier label — large and bold in mult_w column (Phase 3 redesign).
+      mult_font_sz = max(min((lane_h * 0.55)|0, 22), 10);
+      gfx_setfont(1, "Arial", mult_font_sz, 'b');
+      rec[st_dirty] ? set_color(C_MULT_LABEL) : set_color(C_MULT_INACTIVE);
       is_flex_mode() ? (
-        gfx_setfont(1,"Arial",8);
-        gfx_set(0.7, 0.85, 1.0);
-        gfx_x = state_x + 2;
-        gfx_y = row_y + lane_h - 11;
         i == g_flex_rec_owner_idx ? (
-          // Live variable-length recording: show "REC→Nx" where N is the predicted commit
           g_flex_base_len > 0 ? (
-            gfx_printf("→%dx", max(1, ceil(g_flex_rec_raw_len / g_flex_base_len)));
+            sprintf(#_mtxt, "→%dx", max(1, ceil(g_flex_rec_raw_len / g_flex_base_len)));
           ) : (
-            gfx_printf("REC");
+            strcpy(#_mtxt, "REC");
           );
         ) : rec[st_loop_len] > 0 && g_flex_base_len > 0 ? (
-          gfx_printf("%dx", max(1, (rec[st_loop_len] / g_flex_base_len + 0.5) | 0));
+          sprintf(#_mtxt, "%dx", max(1, (rec[st_loop_len] / g_flex_base_len + 0.5) | 0));
         ) : rec[st_dirty] == 0 ? (
-          gfx_printf("--");
+          strcpy(#_mtxt, "--");
+        ) : (
+          strcpy(#_mtxt, "1x");
         );
-        gfx_setfont(0);
+      ) : (
+        rec[st_dirty] ? strcpy(#_mtxt, "1x") : strcpy(#_mtxt, "--");
       );
+      gfx_measurestr(#_mtxt, tw, th);
+      gfx_x = state_x + num_w + (mult_w - tw) * 0.5;
+      gfx_y = row_y + (lane_h - th) * 0.5;
+      gfx_drawstr(#_mtxt);
+      gfx_setfont(0);
 
       // Waveform sub-panel — inset 2 px top/bottom so the PR contour border
       // remains visible between lanes (matching the ~4 px border on the right side).
-      gfx_set(0x14/255.0, 0x14/255.0, 0x20/255.0);
+      set_color(C_WAVE_TROUGH);
       gfx_rect(wave_x, row_y + 2, wave_w, lane_h - 4);
       // thin left separator between lane number area and waveform
-      gfx_set(0x30/255.0, 0x30/255.0, 0x50/255.0);
+      set_color(0x303050);
       gfx_rect(wave_x, row_y + 2, 1, lane_h - 4);
 
       // Per-lane progress fill (ultra_redesign.md Phase 1+2).
@@ -2765,10 +2875,10 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       rec[st_dirty] > 0 ? (
         wl = floor((wave_w - 1 - peak_w) * get_lane_progress_frac(i) + 0.5);
         wl > 0 ? (
-          // Phase 6: boosted fill colors for legibility behind the waveform.
-          rec[st_state] == 1 ? gfx_set(0x1A/255.0, 0x4E/255.0, 0x1A/255.0) :  // playing: green
-          rec[st_state] >= 2 ? gfx_set(0x4E/255.0, 0x1A/255.0, 0x1A/255.0) :  // rec/overdub: red
-                               gfx_set(0x25/255.0, 0x25/255.0, 0x42/255.0);    // stopped: dim blue
+          // Progress fill: vivid colors per state
+          rec[st_state] == 1 ? set_color(C_PROG_PLAY) :  // playing: green
+          rec[st_state] >= 2 ? set_color(C_PROG_REC)  :  // rec/overdub: red
+                               set_color(C_PROG_STOP);    // stopped: dim blue
           gfx_rect(wave_x + 1 + peak_w, row_y + 2, wl, lane_h - 4);
         );
       );
@@ -2781,7 +2891,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       is_flex_mode() && rec[st_loop_len] > 0 && g_flex_base_len > 0 ? (
         wl = max(1, (rec[st_loop_len] / g_flex_base_len + 0.5) | 0);
         wl > 1 ? (
-          gfx_set(0.32, 0.32, 0.56);
+          gfx_set(0.38, 0.38, 0.62);
           t = 1;
           loop(wl - 1,
             mx = wave_x + 1 + peak_w + floor((wave_w - 1 - peak_w) * t / wl + 0.5);
@@ -2799,33 +2909,41 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       gfx_set(0.75, 0.75, 0);
       gfx_rect(wave_x + 2, row_y + 2 + ((lane_h - 4) - g_curpk_h), peak_w, g_curpk_h);
 
-      // Waveform content (ultra_redesign.md Phase 3: lane-specific display length).
-      // get_lane_waveform_display_len() returns st_loop_len for committed Flex lanes so
-      // longer recordings are horizontally compressed to fit the same panel width.
-      // Classic mode and uncommitted Flex lanes fall back to g_length unchanged.
-      gfx_set(0.5);
-      rec[st_dirty] && (wl = get_lane_waveform_display_len(i, rec)) > 0 ?
-        draw_waveform(wave_x + peak_w + gap, row_cy, wave_w - peak_w - gap*2, (lane_h-4)*0.4,
-                      rec[st_buf], (g_offs % wl), wl, i);
+      // Waveform: single colour drawn over the progress bar background.
+      // Splitting played/unplayed required two expensive draw_waveform calls per
+      // lane and caused sluggish/shaky animation; the solid progress fill already
+      // communicates position clearly.
+      rec[st_dirty] && (wl = get_lane_waveform_display_len(i, rec)) > 0 ? (
+        set_color(C_WAVE_UNPLAYED);
+        draw_waveform(wave_x + peak_w + gap, row_cy,
+                      wave_w - peak_w - gap * 2, (lane_h-4)*0.45,
+                      rec[st_buf], g_offs % wl, wl, i);
+      );
 
-      // Monitor icon (speaker, 3-state) — right-aligned
+      // Monitor icon: off=grayed-out, on=vivid lane-status color
       mx = mon_x;
       my = row_cy - (mon_sz/2)|0;
-
-      rec[st_monmode] == 0 ? gfx_set(0.2) :
-      rec[st_monmode] == 1 ? ((mode&8) ? gfx_set(0.3,0.3,1.0) : gfx_set(0.3,0.3,0.7)) :
-                              gfx_set(0.9,0.8,0);
-      gfx_rect(mx, my, mon_sz, mon_sz);
-
-      rec[st_monmode] == 0 ? gfx_set(0) :
-      (rec[st_monmode] == 2 || (mode&8)) ? gfx_set(1,1,1,1) : gfx_set(1,1,1,.25);
-      draw_speaker(mx + mon_sz/2, my + mon_sz/2, mon_sz/2);
-
-      rec[st_monmode] == 0 ? (
-        gfx_set(0);
-        gfx_line(mx, my, mx+mon_sz, my+mon_sz);
-        gfx_line(mx+mon_sz, my, mx, my+mon_sz);
+      rec[st_monmode] > 0 ? (
+        rec[st_state] >= 2 ? set_color(C_LANE_REC) :
+        rec[st_state] == 1 ? set_color(C_LANE_PLAY) :
+                             set_color(C_LANE_STOP_CONT);
+        gfx_rect(mx, my, mon_sz, mon_sz);
+        rec[st_state] >= 2 ? set_color(C_MON_REC_FG) :
+        rec[st_state] == 1 ? set_color(C_MON_PLAY_FG) :
+                             set_color(C_MON_STOP_FG);
+      ) : (
+        set_color(C_MON_OFF_BG);
+        gfx_rect(mx, my, mon_sz, mon_sz);
+        set_color(C_MON_OFF_FG);
       );
+      gfx_rect(mx, my, mon_sz, 1);
+      gfx_rect(mx, my+mon_sz-1, mon_sz, 1);
+      gfx_rect(mx, my, 1, mon_sz);
+      gfx_rect(mx+mon_sz-1, my, 1, mon_sz);
+      spk_icon_sz = mon_sz * 0.5;
+      spk_icon_x = mx + (mon_sz - spk_icon_sz) * 0.5;
+      spk_icon_y = my + (mon_sz - spk_icon_sz) * 0.5;
+      draw_speaker_clean(spk_icon_x, spk_icon_y, spk_icon_sz, spk_icon_sz);
 
     ) : (
       wantr = 0;
@@ -2888,25 +3006,39 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       sliderchange(-1);
     );
 
-    // Link button on right edge, spanning both lanes of a pair
-    (i&1) && force_redraw ? (
-      ty = row_y - lane_h;
+    // Link button: chain-link icon, centered in state_w, straddling pair boundary
+    (i&1) && wantr ? (
+      link_x = state_x + ((state_w - link_btn_w) * 0.5)|0;
+      link_y = row_y - (link_btn_h / 2)|0;
+      link_cx = link_x + link_btn_w * 0.5;
+      link_cy = link_y + link_btn_h * 0.5;
       t = get_linked_rec(i) >= 0;
+      // Background: always dark GUI colour
+      set_color(C_BG_BASE);
+      gfx_rect(link_x, link_y, link_btn_w, link_btn_h);
+      // Border: lane-status highlight colour
+      rec[st_state] >= 2 ? set_color(C_CONT_REC) :
+      rec[st_state] == 1 ? set_color(C_CONT_PLAY) :
+                           set_color(C_CONT_STOP);
+      gfx_rect(link_x, link_y, link_btn_w, 1);
+      gfx_rect(link_x, link_y + link_btn_h - 1, link_btn_w, 1);
+      gfx_rect(link_x, link_y, 1, link_btn_h);
+      gfx_rect(link_x + link_btn_w - 1, link_y, 1, link_btn_h);
+      // Horizontal chain-link icon: two rings connected by a centre bar
+      t ? set_color(0xFFFFFF) : set_color(C_LINK_OFF_FG);
+      lk_r = max(3, (link_btn_h * 0.14)|0);    // ring radius
+      lk_sep = max(5, (link_btn_w * 0.30)|0);  // horizontal offset from centre
+      gfx_circle(link_cx - lk_sep, link_cy, lk_r, 0, 1);
+      gfx_circle(link_cx + lk_sep, link_cy, lk_r, 0, 1);
       t ? (
-        gfx_set(0.15, 0.35, 0.65);
-        gfx_rect(gfx_w-23, ty+2, 21, lane_h*2-4);
-        gfx_set(0.85, 0.92, 1.0);
+        // Linked: horizontal bar connecting the two rings
+        gfx_rect((link_cx - lk_sep + lk_r)|0, (link_cy - 1)|0,
+                 (lk_sep * 2 - lk_r * 2)|0, 3);
       ) : (
-        gfx_set(0.14, 0.14, 0.22);
-        gfx_rect(gfx_w-23, ty+2, 21, lane_h*2-4);
-        gfx_set(0.38, 0.38, 0.52);
+        // Unlinked: leave gap — no bar, rings appear broken apart
+        set_color(C_BG_BASE);
+        gfx_rect((link_cx - 2)|0, (link_cy - 1)|0, 5, 3);
       );
-      gfx_setfont(1,"Arial",9);
-      gfx_measurestr("lnk",tw,th);
-      gfx_x = gfx_w-23 + (21-tw)*0.5;
-      gfx_y = ty + lane_h - th*0.5;
-      gfx_drawstr("lnk");
-      gfx_setfont(0);
     );
 
     i += 1;
@@ -2918,9 +3050,12 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   lx = 0;
   t = 0;
   force_redraw ? (
+    // Clear the full area from action strip to window bottom (hides old tweakers)
+    set_color(C_BG_BASE);
+    gfx_rect(0, action_y, gfx_w, gfx_h - action_y);
     // Strip background
-    PR.Color.Panel = "101018FF";
-    PR.Color.Contour = "1A1A28FF";
+    PR.Color.Panel = "0C0C14FF";
+    PR.Color.Contour = "181826FF";
     PR.DisplayPanel(
       gfx_w * 0.5 / pr_s * 100,
       (action_y + action_h * 0.5) / pr_s * 100,
@@ -2931,14 +3066,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   while ((i = mem_gen_order[t]) >= 0) (
     force_redraw ? (
       // Per-button colored panel (PR library replaces draw_button)
-      i == 1  ? (PR.Color.Panel = "005F73FF"; PR.Color.Contour = "208099FF") :
-      i == 2  ? (PR.Color.Panel = "007360FF"; PR.Color.Contour = "209980FF") :
-      i == 3  ? (PR.Color.Panel = "00734DFF"; PR.Color.Contour = "209966FF") :
-      i == 7  ? (PR.Color.Panel = "5A3A5AFF"; PR.Color.Contour = "806080FF") :
-      i == 11 ? (PR.Color.Panel = "006060FF"; PR.Color.Contour = "208080FF") :
-      i == 14 ? (PR.Color.Panel = "007000FF"; PR.Color.Contour = "20A020FF") :
-      i == 15 ? (PR.Color.Panel = "805F00FF"; PR.Color.Contour = "B08020FF") :
-               (PR.Color.Panel = "600000FF"; PR.Color.Contour = "902020FF");
+      PR.Color.Panel = "14303CFF";
+      PR.Color.Contour = "216077FF";
       PR.DisplayPanel(
         (lx + w * 0.5) / pr_s * 100,
         (action_y + (action_h - 2) * 0.5) / pr_s * 100,
@@ -2956,7 +3085,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     );
     i += mem_gen_cfg;
     // MIDI assignment button: centered horizontally, half inside strip / half in empty space below
-    draw_value_tweaker(lx + ((w - 45)/2)|0, action_y + action_h - 21, i, force_redraw, 0);
+    g_show_advanced ? draw_value_tweaker(lx + ((w - 45)/2)|0, action_y + action_h - 21, i, force_redraw, 0);
     !(last_mouse_cap&1) && (mouse_cap&1) && mouse_in(lx, action_y, w, action_h) ? (
       i == cfgp_reset        ? strcat(#mainthread_todo, "r") :
       i == cfgp_halve        ? strcat(#mainthread_todo, "h") :
@@ -2973,29 +3102,98 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
 
 // ultra_redesign.md Phase 5: in Flex mode the bar now clearly labels itself as the
 // BASE/sync loop reference.  Classic mode is visually unchanged.
-function draw_position(ypos) local(last_pos,last_len)
+function draw_position(ypos) local(last_pos, last_len, bar_h, lbl_w, lh, bar_x, bpm_val, ms_val)
 (
   last_w != gfx_w || last_h != gfx_h || last_pos != g_pos || last_len != g_length ? (
     last_len = g_length;
     last_pos = g_pos;
-    gfx_set(0.05, 0.05, 0.13);  // dark navy trough
-    gfx_rect(0, ypos, gfx_w, 20);
-    gfx_set(0.10, 0.22, 0.55);  // blue playhead fill
-    g_length > 0 ? gfx_rect(0, ypos, g_pos/g_length * gfx_w, 20);
-    gfx_x = 2;
-    gfx_y = ypos + 2;
+    bar_h = 22;
+    bpm_val = cfgp_sync[] ? tempo : estbpm(last_len);
+    ms_val  = last_len / srate * 1000;
+
+    // Trough background
+    set_color(0x080810);
+    gfx_rect(0, ypos, gfx_w, bar_h);
+
+    // Measure label to compute bar start offset
+    gfx_setfont(1, "Arial", 10);
     is_flex_mode() ? (
-      // De-emphasise: muted text and "BASE" prefix so this bar is clearly the
-      // shared sync reference, not the progress of every lane individually.
-      gfx_set(0.55, 0.78, 0.55);
-      gfx_printf("BASE  %d mS  %.1f BPM", g_length/srate * 1000,
-        cfgp_sync[] ? tempo : estbpm(last_len));
+      gfx_measurestr(sprintf(#_pb, "BASE  %d mS  %.1f BPM", ms_val, bpm_val), lbl_w, lh);
     ) : (
-      gfx_set(1, 1, 1);
-      gfx_printf("%d mS\n%.1f BPM", g_length/srate * 1000,
-        cfgp_sync[] ? tempo : estbpm(last_len));
+      gfx_measurestr(sprintf(#_pb, "BPM  %.1f   TIMEBASE  %d mS", bpm_val, ms_val), lbl_w, lh);
     );
+    bar_x = lbl_w + 16;
+
+    // Progress fill (right of label)
+    set_color(0x1040A0);
+    last_len > 0 ? gfx_rect(bar_x, ypos, (last_pos / last_len) * (gfx_w - bar_x), bar_h);
+
+    // Label text
+    is_flex_mode() ? set_color(0x8DC88D) : set_color(0xCCCCDD);
+    gfx_x = 4; gfx_y = ypos + (bar_h - lh) * 0.5;
+    gfx_drawstr(#_pb);
+    gfx_setfont(0);
   );
+);
+
+function draw_pill_toggle(xp, yp, label, is_on)
+  instance(x, y, w, h)
+  globals(gfx_x, gfx_y, C_PILL_LABEL, C_PILL_ON_DOT, C_PILL_OFF_DOT)
+  local(lw lh dot_sz gap_inner total_w total_h)
+(
+  gfx_setfont(1, "Arial", 13);
+  gfx_measurestr(label, lw, lh);
+  dot_sz = 8;
+  gap_inner = 5;
+  total_w = lw + dot_sz + gap_inner + 8;
+  total_h = lh + 8;
+  x = xp; y = yp; w = total_w; h = total_h;
+  // Background
+  gfx_set(0.10, 0.10, 0.16);
+  gfx_rect(x, y, w, h);
+  // 1px border
+  set_color(0x303048);
+  gfx_rect(x, y, w, 1); gfx_rect(x, y+h-1, w, 1);
+  gfx_rect(x, y, 1, h); gfx_rect(x+w-1, y, 1, h);
+  // Label text (muted)
+  set_color(C_PILL_LABEL);
+  gfx_x = x + 4; gfx_y = y + (total_h - lh) * 0.5;
+  gfx_drawstr(label);
+  // Status dot
+  is_on ? set_color(C_PILL_ON_DOT) : set_color(C_PILL_OFF_DOT);
+  gfx_circle(x + 4 + lw + gap_inner + dot_sz * 0.5, y + total_h * 0.5, dot_sz * 0.5, 1, 1);
+  gfx_x = x + total_w + 5;
+  gfx_setfont(0);
+);
+
+function draw_pill_value(xp, yp, label, valstr)
+  instance(x, y, w, h)
+  globals(gfx_x, gfx_y, C_PILL_LABEL, C_PILL_VALUE)
+  local(lw lh vw vh total_w total_h sep)
+(
+  gfx_setfont(1, "Arial", 13);
+  gfx_measurestr(label, lw, lh);
+  gfx_setfont(1, "Arial", 13, 'b');
+  gfx_measurestr(valstr, vw, vh);
+  sep = 5;
+  total_w = lw + sep + vw + 10;
+  total_h = max(lh, vh) + 8;
+  x = xp; y = yp; w = total_w; h = total_h;
+  gfx_set(0.10, 0.10, 0.16);
+  gfx_rect(x, y, w, h);
+  set_color(0x303050);
+  gfx_rect(x, y, w, 1); gfx_rect(x, y+h-1, w, 1);
+  gfx_rect(x, y, 1, h); gfx_rect(x+w-1, y, 1, h);
+  gfx_setfont(1, "Arial", 13);
+  set_color(C_PILL_LABEL);
+  gfx_x = x + 5; gfx_y = y + (total_h - lh) * 0.5;
+  gfx_drawstr(label);
+  gfx_setfont(1, "Arial", 13, 'b');
+  set_color(C_PILL_VALUE);
+  gfx_x = x + 5 + lw + sep; gfx_y = y + (total_h - vh) * 0.5;
+  gfx_drawstr(valstr);
+  gfx_x = x + total_w + 5;
+  gfx_setfont(0);
 );
 
 function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastclickcount, lastvclickoffs, lastoffs, lastsync, last_show_globals, last_show_advanced, last_pulse, last_flex)
@@ -3008,49 +3206,50 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
                 lastlatch != g_latchmode ||
                 lastclickcount != (cfgp_clickcnt[]|0) ||
                 lastvclickoffs != cfgp_vclick[] ||
-                last_show_globals != g_show_globals ||
                 last_show_advanced != g_show_advanced ||
                 last_pulse != (g_sysex_period_rate > 0) ||
                 last_flex != g_flex_enabled);  // Phase 8
   );
 
   need_ref ? (
-    gfx_set(0, 0, 0.31);  // 00004FFF deep navy per §2.4
-    gfx_rect(0,0,gfx_w,14);
+    set_color(C_BG_TOPBAR);
+    gfx_rect(0, 0, gfx_w, 30);
+    set_color(0x202030);  // separator line
+    gfx_rect(0, 29, gfx_w, 1);
 
-    gfx_x=60;
+    gfx_x = 60;
 
-    lastsync=cfgp_sync[];
-    projsync_button.draw_topbar_button(gfx_x+4,2,lastsync == 2 ? "sync: playback" : lastsync == 0 ? "sync: off" : "sync: project");
+    lastsync = cfgp_sync[];
+    projsync_button.draw_pill_value(gfx_x + 4, 2,
+      "SYNC", lastsync == 2 ? "PLAY" : lastsync == 0 ? "OFF" : "PROJ");
 
     lastlen = g_length;
     lastoffs = g_offs;
     lastgate = cfgp_gate[];
     lastvclickoffs = cfgp_vclick[];
 
-    lastsync==0 ? (
-      offs_button.draw_topbar_button(gfx_x+4,2, sprintf(#,"offs %.0f spls", g_offs));
-      length_button.draw_topbar_button(gfx_x+4,2, sprintf(#,"%.0f spls", g_length));
+    lastsync == 0 ? (
+      offs_button.draw_pill_value(gfx_x + 4, 2, "OFFSETS", sprintf(#, "%.0f", g_offs));
+      length_button.draw_pill_value(gfx_x + 4, 2, "SPLS", sprintf(#, "%.0f", g_length));
     );
 
-    lastclickcount = cfgp_clickcnt[]|0;
+    lastclickcount = cfgp_clickcnt[] | 0;
 
-    clickcnt_button.draw_topbar_button(gfx_x+4,2,
-      lastsync ?
-       lastclickcount==0 ? "length: measure" : sprintf(#,"length: %d",lastclickcount)
-       : sprintf(#,"click cnt: %d",lastclickcount)
-    );
+    clickcnt_button.draw_pill_value(gfx_x + 4, 2,
+      lastsync ? "LENGTH" : "CLK CNT",
+      lastsync ? (lastclickcount == 0 ? "MEAS" : sprintf(#, "%d", lastclickcount))
+               : sprintf(#, "%d", lastclickcount));
 
-    lastclickcount>0||lastsync ? vclick_button.draw_topbar_button(gfx_x+4,2, lastvclickoffs>0 ? sprintf(#,"vclick: +%.1fmS",lastvclickoffs): "vclick: off");
+    lastclickcount > 0 || lastsync ? vclick_button.draw_pill_value(gfx_x + 4, 2,
+      "VCLICK", lastvclickoffs > 0 ? sprintf(#, "+%.1f", lastvclickoffs) : "OFF");
 
-    lastsync == 0 ?  gate_button.draw_topbar_button(gfx_x+4,2,cfgp_gate[] < g_infthreshdb ? "gate: -inf dB" : sprintf(#,"gate: %.0fdB",lastgate));
+    lastsync == 0 ? gate_button.draw_pill_value(gfx_x + 4, 2,
+      "GATE", cfgp_gate[] < g_infthreshdb ? "-inf" : sprintf(#, "%.0fdB", lastgate));
 
-    latch_button.draw_topbar_button(gfx_x+4,2, (lastlatch=g_latchmode) ? "latch on" : "latch off");
-    // Phase 8: Flex Mode length toggle
-    flex_button.draw_topbar_button(gfx_x+4,2, (last_flex=g_flex_enabled) ? "Flex on" : "Flex off");
-    common_button.draw_topbar_button(gfx_x+4,2, (last_show_globals=g_show_globals) ? "Globals on" : "Globals off");
-    advanced_button.draw_topbar_button(gfx_x+4,2, (last_show_advanced=g_show_advanced) ? "Advanced on" : "Advanced off");
-    pulse_button.draw_topbar_button(gfx_x+4,2, (last_pulse=(g_sysex_period_rate>0)) ? "Pulse on" : "Pulse off");
+    latch_button.draw_pill_toggle(gfx_x + 4, 2, "LATCH", (lastlatch = g_latchmode));
+    flex_button.draw_pill_toggle(gfx_x + 4, 2, "FLEX", (last_flex = g_flex_enabled));
+    advanced_button.draw_pill_toggle(gfx_x + 4, 2, "CTRL", (last_show_advanced = g_show_advanced));
+    pulse_button.draw_pill_toggle(gfx_x + 4, 2, "PULSE", (last_pulse = (g_sysex_period_rate > 0)));
   );
 
   (mouse_cap&1) && !(mouse_cap&2) ? (
@@ -3063,16 +3262,14 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
       ) : latch_button.hit_topbar_button(mouse_x,mouse_y,-1) ? (
         // toggle
         cfgp_latch[] = g_latchmode = !g_latchmode;
-      ) : common_button.hit_topbar_button(mouse_x,mouse_y,-1) ? (
-        g_show_globals = !g_show_globals;
-        mem_gen_cfg[23] = g_show_globals;
-        sliderchange(-1); // persist to @serialize
-        last_w = 0;       // force full redraw to show/hide Globals strip
       ) : advanced_button.hit_topbar_button(mouse_x,mouse_y,-1) ? (
         g_show_advanced = !g_show_advanced;
+        // Globals bar is shown/hidden together with CTRL
+        g_show_globals = g_show_advanced;
+        mem_gen_cfg[23] = g_show_globals;
         mem_gen_cfg[24] = g_show_advanced;
         sliderchange(-1); // persist to @serialize
-        last_w = 0;       // force full redraw to show/hide advanced controls
+        last_w = 0;       // force full redraw to show/hide advanced controls + globals
       ) : flex_button.hit_topbar_button(mouse_x,mouse_y,-1) ? (
         // Phase 8: toggle Flex Mode; reset transport state so a fresh start is clean.
         g_flex_enabled = !g_flex_enabled;
@@ -3236,13 +3433,14 @@ function draw_trim_waveform(xpos, ypos, w, h, chan, isend)
   );
 
   last_w != gfx_w || last_h != gfx_h ? (
-    gfx_set(0.05, 0.05, 0.10);  // deep dark navy base (§2.4)
+    gfx_set(0x13/255.0, 0x17/255.0, 0x1C/255.0);  // main UI base color
     gfx_rect(0,0,gfx_w,gfx_h);
   );
 
+  gfx_a = 1;  // reset alpha corrupted by PR lib shadow in previous frame
   draw_topbar(last_w != gfx_w || last_h != gfx_h);
-  draw_position(15);
-  draw(0, 40);
+  draw_position(30);
+  draw(0, 52);
   
   gfx_x=0;
   gfx_y=gfx_h-8;
@@ -3288,7 +3486,7 @@ function draw_trim_waveform(xpos, ypos, w, h, chan, isend)
   vclick_pos >= 0 ? draw_vclick(vclick_pos,vclick_len);
   
   cap_mode == cfgp_offs || cap_mode == cfgp_length ? (
-    g_edgetrim_drawstate>=0 ? (
+    g_edgetrim_drawstate>0 ? (
       draw_trim_waveform(0,40,gfx_w,gfx_h-40, max(g_chan_selected,0), cap_mode == cfgp_length);
       g_edgetrim_drawstate=1;
     );
