@@ -3617,27 +3617,96 @@ function draw_trim_waveform(xpos, ypos, w, h, chan, isend)
 ); // !(gfx_ext_flags&2)
 
 
-function export()  local(rec, flag, tidx, idx, ster, l)
+// ── Integer GCD / LCM helpers (used by export) ──────────────────────────────────────────────
+function gcd(a, b) local(t) ( while (b > 0) ( t = b; b = a % b; a = t; ); a; );
+function lcm(a, b) local(g) ( g = gcd(a|0, b|0); g > 0 ? (a|0) / g * (b|0) : 0; );
+
+// Add To Project — Flex-aware tiling export.
+//
+// Each lane is tiled so that the total exported duration equals the LCM of all
+// active lane lengths.  In Flex mode this reproduces the looper’s steady-state
+// playback exactly: a 1× lane repeats 6× inside a 6× total when combined with
+// 2× and 3× lanes; they all lock up to the same grid.  In non-Flex mode the
+// LCM collapses to g_length, so a div=2 lane gets 2 copies, div=1 gets 1, etc.
+//
+// Phase rotation: in Flex mode st_loop_phase records the g_flex_pos at which
+// buffer position 0 was captured.  We rotate the read start so that the first
+// exported sample corresponds to global beat-0.  The first rep is split into a
+// tail chunk [rotation..l-1] then a head chunk [0..rotation-1]; subsequent reps
+// are exported whole.  In non-Flex mode g_offs fills the same role.
+function export()  local(rec, flag, tidx, idx, ster, l, total_len, reps, rotation, ch2off)
 (
-  rec = mem_stlist;
-  flag=1<<16; // go to end of project
-  flag|=2<<16; // use tempo from next parameter
-  tidx = idx = 0;
-  g_length > 0 ? loop(g_nchan,
-    !(idx&1) || get_linked_rec(idx)<0 ? (
-      ster = get_linked_rec(idx);
-      rec[st_dirty] > 0 ? (
-        l = (g_length / rec[st_div])|0;
-        export_buffer_to_project(rec[st_buf]+g_offs%l,l, ster>=0 ? 2 : 1,srate,tidx, flag,
-          flag?(cfgp_sync[] ? tempo : estbpm(g_length)),
-          ster>=0 ? ster[st_buf] - rec[st_buf] : 0
-        );
-        flag=0; // only go to end/set tempo for first item
+  // ── Step 1: LCM total duration across all active lane lengths ──────────────────────────
+  total_len = 0;
+  rec = mem_stlist; idx = 0;
+  loop(g_nchan,
+    (rec[st_dirty] > 0 && (!(idx&1) || get_linked_rec(idx)<0)) ? (
+      l = is_flex_mode() && rec[st_loop_len] > 0
+          ? rec[st_loop_len]
+          : (g_length > 0 ? (g_length / max(1, rec[st_div]))|0 : 0);
+      l > 0 ? (
+        total_len = total_len > 0 ? lcm(total_len, l) : l;
       );
-      tidx += 1;
     );
-    idx += 1;
-    rec+=st_num;
+    idx += 1; rec += st_num;
+  );
+  total_len <= 0 ? total_len = g_length; // guard – nothing dirty yet
+
+  total_len > 0 ? (
+    rec = mem_stlist;
+    flag = (1<<16)|(2<<16); // go to end of project; use custom tempo
+    tidx = idx = 0;
+
+    loop(g_nchan,
+      !(idx&1) || get_linked_rec(idx)<0 ? (
+        ster = get_linked_rec(idx);
+        ch2off = ster>=0 ? ster[st_buf] - rec[st_buf] : 0;
+
+        rec[st_dirty] > 0 ? (
+          // ── Lane loop length ───────────────────────────────────────────────────
+          l = is_flex_mode() && rec[st_loop_len] > 0
+              ? rec[st_loop_len]
+              : (g_length / max(1, rec[st_div]))|0;
+
+          l > 0 ? (
+            reps = (total_len / l + 0.5)|0;
+
+            // ── Phase rotation ──────────────────────────────────────────────────────────────────
+            is_flex_mode() ? (
+              rotation = (l - (rec[st_loop_phase] % l)) % l;
+            ) : (
+              rotation = g_offs > 0 ? g_offs % l : 0;
+            );
+
+            rotation > 0 ? (
+              // First rep split: tail [rotation … l-1] then head [0 … rotation-1]
+              export_buffer_to_project(rec[st_buf]+rotation, l-rotation,
+                ster>=0?2:1, srate, tidx, flag,
+                flag?(cfgp_sync[]?tempo:estbpm(g_length)):0, ch2off);
+              flag = 0;
+              export_buffer_to_project(rec[st_buf], rotation,
+                ster>=0?2:1, srate, tidx, 0, 0, ch2off);
+              // Remaining reps-1 full copies
+              loop(reps-1,
+                export_buffer_to_project(rec[st_buf], l,
+                  ster>=0?2:1, srate, tidx, 0, 0, ch2off);
+              );
+            ) : (
+              // No rotation needed: tile reps straight copies
+              loop(reps,
+                export_buffer_to_project(rec[st_buf], l,
+                  ster>=0?2:1, srate, tidx, flag,
+                  flag?(cfgp_sync[]?tempo:estbpm(g_length)):0, ch2off);
+                flag = 0;
+              );
+            );
+          );
+        );
+
+        tidx += 1;
+      );
+      idx += 1; rec += st_num;
+    );
   );
 );
 
