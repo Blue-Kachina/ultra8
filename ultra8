@@ -133,8 +133,9 @@ st_redo_len  = 21; // samples stored in redo snapshot (0 = no redo available)
 st_loop_len      = 22; // committed loop length in samples (0 = empty / not yet set)
 st_undo_loop_len = 23; // loop length saved alongside the undo audio snapshot
 st_redo_loop_len = 24; // loop length saved alongside the redo audio snapshot
+st_loop_phase    = 25; // g_flex_pos value at which this lane's buffer position 0 begins
 // ─────────────────────────────────────────────────────────────────────────────
-st_num = 25;
+st_num = 26;
 
 function recalc_fades() (
   g_fadespeed = exp(-1/(srate * 0.002));  // fade speed for monitoring
@@ -198,6 +199,7 @@ function init(x, n1,n2,n3)
   rec[st_loop_len]      = 0;
   rec[st_undo_loop_len] = 0;
   rec[st_redo_loop_len] = 0;
+  rec[st_loop_phase]    = 0;
 
   this.updatefromrec();
 );
@@ -308,6 +310,26 @@ function set_effective_loop_len(idx, len) local(oidx pidx orec prec) (
   );
 );
 
+// Returns the Flex recording-start phase for lane idx (via pair owner).
+// Phase = the g_flex_pos value at which buffer position 0 was recorded.
+function get_effective_loop_phase(idx) local(oidx orec) (
+  oidx = pair_owner_idx(idx);
+  orec = mem_stlist + oidx * st_num;
+  orec[st_loop_phase];
+);
+
+// Sets st_loop_phase on both the owner and the partner lane (when linked).
+function set_effective_loop_phase(idx, phase) local(oidx pidx orec prec) (
+  oidx = pair_owner_idx(idx);
+  pidx = pair_partner_idx(oidx);
+  orec = mem_stlist + oidx * st_num;
+  orec[st_loop_phase] = phase;
+  pidx >= 0 ? (
+    prec = mem_stlist + pidx * st_num;
+    prec[st_loop_phase] = phase;
+  );
+);
+
 // Returns the effective playback length for lane idx:
 //   Flex Mode + lane has content  → get_effective_loop_len(idx)
 //   Flex Mode + lane empty        → g_flex_base_len (or g_length fallback)
@@ -322,13 +344,23 @@ function get_lane_play_len(idx) local(ll) (
 );
 
 // Returns the effective playback position for lane idx:
-//   Flex Mode (steady-state, g_firstrec==0) → g_flex_pos modulo the lane's own play length
+//   Flex Mode (steady-state, g_firstrec==0) → (g_flex_pos - lane_phase) modulo the lane's own play length
 //   Flex Mode (first-rec, g_firstrec>0)     → g_pos (avoids g_pos%g_pos=0 trap)
 //   Non-Flex                                → g_pos
-function get_lane_play_pos(idx) local(ll) (
+// The per-lane phase (st_loop_phase) stores the g_flex_pos at which buffer
+// position 0 was recorded.  Subtracting it ensures that a lane recorded
+// starting mid-session plays back from the correct buffer offset.
+function get_lane_play_pos(idx) local(ll phase pos) (
   is_flex_mode() && g_firstrec == 0 ? (
     ll = get_lane_play_len(idx);
-    ll > 0 ? g_flex_pos % ll : 0;
+    ll > 0 ? (
+      phase = get_effective_loop_phase(idx);
+      pos = (g_flex_pos - phase) % ll;
+      pos < 0 ? pos += ll;
+      pos;
+    ) : (
+      0;
+    );
   ) : (
     g_pos;
   );
@@ -530,6 +562,7 @@ function setstate(st) instance(fpos_slope, fpos2_slope, rec) local(dt)
         is_flex_mode() && has_flex_base() && st == 2 && rec[st_dirty] == 0 ? (
           g_flex_rec_owner_idx = pair_owner_idx(this.idx);
           g_flex_rec_raw_len   = 0;
+          set_effective_loop_phase(this.idx, g_flex_pos);
           // Buffer at linear positions 0..g_maxlen may hold stale content from
           // a prior recording (dt==0 so set_need_zero was skipped above). Schedule
           // a full defensive zero so process_need_zero clears each position before
@@ -838,6 +871,7 @@ function clear_pair(idx) local(oidx pidx orec prec) (
   orec[st_loop_len]      = 0; // Phase 1: Flex length reset on clear
   orec[st_undo_loop_len] = 0;
   orec[st_redo_loop_len] = 0;
+  orec[st_loop_phase]    = 0; // reset phase so re-recording captures a fresh start
   // Clear partner when linked
   pidx >= 0 ? (
     prec = mem_stlist + pidx * st_num;
@@ -849,6 +883,7 @@ function clear_pair(idx) local(oidx pidx orec prec) (
     prec[st_loop_len]      = 0;
     prec[st_undo_loop_len] = 0;
     prec[st_redo_loop_len] = 0;
+    prec[st_loop_phase]    = 0;
   );
   is_flex_mode() ? recalc_flex_base_len();
 );
@@ -881,6 +916,7 @@ function onmsg(m1,m2,m3) instance(rec,note,note2,note3,note4,note5,note6,note7)
      g_lane_mon_req = this.idx + 1;
    );
    newstate >= 0 ? (
+     newstate == 2 ? snapshot_pair(this.idx); // save pre-overdub undo snapshot
      setstate_pair(this.idx, newstate);
      select_pair(this.idx);
    );
@@ -1067,6 +1103,7 @@ function reset() local(lp)
     lp[st_loop_len]      = 0; // Phase 1: clear Flex lane length on kill-all
     lp[st_undo_loop_len] = 0;
     lp[st_redo_loop_len] = 0;
+    lp[st_loop_phase]    = 0;
     lp += st_num;
   );
   g_firstrec=g_offs=g_length=g_pos=0;
@@ -1172,7 +1209,7 @@ function build_sysex_snapshot()
     // In non-Flex Mode (or when the lane has no committed length), use the shared
     // g_pos / g_length as before.
     is_flex_mode() && rec[st_loop_len] > 0 && rec[st_state] != 0 ? (
-      loop_phase = min(127, (g_flex_pos % rec[st_loop_len]) / rec[st_loop_len] * 127 | 0);
+      loop_phase = min(127, ((g_flex_pos - get_effective_loop_phase(i)) % rec[st_loop_len]) / rec[st_loop_len] * 127 | 0);
     ) : (
       loop_phase = (g_length > 0 && rec[st_state] != 0)
                    ? min(127, g_pos / g_length * 127 | 0)
@@ -1352,7 +1389,7 @@ ext_noinit == 0 ? (
   cfgp_common_clr  = mem_gen_cfg + 21;
   cfgp_common_undo = mem_gen_cfg + 22;
   cfgp_common_rev  = mem_gen_cfg + 28;
-  mem_gen_cfg[23]  = 0; // g_show_globals: Globals bar off by default
+  mem_gen_cfg[23]  = 0; // g_show_globals: unused (always forced to 1 at runtime; common-mode dispatch is always on)
   mem_gen_cfg[24]  = 0; // g_show_advanced: Advanced controls off by default
   mem_gen_cfg[29]  = 0; // g_pulse: SysEx heartbeat off by default (QoL 1.1)
   cfgp_common_rdc  = mem_gen_cfg + 25;
@@ -1389,7 +1426,7 @@ ext_noinit == 0 ? (
 
   g_inject_midinote = 0;
   g_ui_dispatch = 0;  // set to 1 when a UI-injected command is pre-loaded, so it bypasses the common-mode gate
-  g_show_globals = 0;       // Globals bar off by default (synced from mem_gen_cfg[23] after serialize)
+  g_show_globals = 1;       // Common-mode MIDI dispatch always on (g_show_advanced drives UI visibility)
   g_show_advanced = 0;      // Advanced controls off by default (synced from mem_gen_cfg[24] after serialize)
   g_lane_clear_req = 0;
   g_lane_undo_req = 0;
@@ -1615,7 +1652,7 @@ function doconf() local(i,s) (
     g_slider_sync = cfgp_sync[];
     g_latchmode = cfgp_latch[];
     g_slider_click_cnt = cfgp_clickcnt[]|0;
-    g_show_globals = mem_gen_cfg[23]; // restore Globals toggle from saved state
+    g_show_globals = 1; // common-mode MIDI dispatch always on - not toggled by CTRL
     g_show_advanced = mem_gen_cfg[24]; // restore Advanced toggle from saved state
     g_sysex_period_rate = mem_gen_cfg[29] ? 1.0 : 0; // restore Pulse toggle from saved state
 
@@ -2541,7 +2578,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   force_redraw = gfx_w != last_w || gfx_h != last_h ||
     lasthalve != cfgp_fade[] || lastlen != g_length ||
     lastoffs != g_offs || lastchanlink != cfgp_link[] ||
-    last_show_globals != g_show_globals ||
+    last_show_globals != g_show_advanced ||
     last_show_advanced != g_show_advanced ||
     last_pulse != (g_sysex_period_rate > 0) ||
     last_flex != g_flex_enabled ||         // Phase 8: redraw on Flex Mode toggle
@@ -2550,7 +2587,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   lastlen = g_length;
   lastoffs = g_offs;
   lastchanlink = cfgp_link[];
-  last_show_globals = g_show_globals;
+  last_show_globals = g_show_advanced;
   last_show_advanced = g_show_advanced;
   last_pulse = (g_sysex_period_rate > 0);
   last_flex = g_flex_enabled;           // Phase 8
@@ -2578,7 +2615,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   // same x coordinates as their lane siblings.
   action_h = 72;
   action_y = gfx_h - action_h - 21;  // 21px empty space below action strip
-  lane_ypos = ypos + (g_show_globals ? 56 : 0);
+  lane_ypos = ypos + (g_show_advanced ? 56 : 0);
   avail_lanes = action_y - lane_ypos;
   lane_h = max((avail_lanes / g_nchan)|0, 20);
 
@@ -2633,7 +2670,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   wave_w = max(r_pos - wave_x - gap, 30);
 
   // Common mode global strip
-  g_show_globals ? (
+  g_show_advanced ? (
     force_redraw ? (
       // Overall strip background
       PR.Color.Panel = "181030FF";
@@ -2920,30 +2957,33 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
                       rec[st_buf], g_offs % wl, wl, i);
       );
 
-      // Monitor icon: off=grayed-out, on=vivid lane-status color
-      mx = mon_x;
-      my = row_cy - (mon_sz/2)|0;
-      rec[st_monmode] > 0 ? (
-        rec[st_state] >= 2 ? set_color(C_LANE_REC) :
-        rec[st_state] == 1 ? set_color(C_LANE_PLAY) :
-                             set_color(C_LANE_STOP_CONT);
-        gfx_rect(mx, my, mon_sz, mon_sz);
-        rec[st_state] >= 2 ? set_color(C_MON_REC_FG) :
-        rec[st_state] == 1 ? set_color(C_MON_PLAY_FG) :
-                             set_color(C_MON_STOP_FG);
-      ) : (
-        set_color(C_MON_OFF_BG);
-        gfx_rect(mx, my, mon_sz, mon_sz);
-        set_color(C_MON_OFF_FG);
+      // Monitor icon: drawn here only for unlinked lanes.
+      // Linked pairs: monitor is drawn during Lane B's iteration at the pair boundary.
+      !is_linked_idx(i) ? (
+        mx = mon_x;
+        my = row_cy - (mon_sz/2)|0;
+        rec[st_monmode] > 0 ? (
+          rec[st_state] >= 2 ? set_color(C_LANE_REC) :
+          rec[st_state] == 1 ? set_color(C_LANE_PLAY) :
+                               set_color(C_LANE_STOP_CONT);
+          gfx_rect(mx, my, mon_sz, mon_sz);
+          rec[st_state] >= 2 ? set_color(C_MON_REC_FG) :
+          rec[st_state] == 1 ? set_color(C_MON_PLAY_FG) :
+                               set_color(C_MON_STOP_FG);
+        ) : (
+          set_color(C_MON_OFF_BG);
+          gfx_rect(mx, my, mon_sz, mon_sz);
+          set_color(C_MON_OFF_FG);
+        );
+        gfx_rect(mx, my, mon_sz, 1);
+        gfx_rect(mx, my+mon_sz-1, mon_sz, 1);
+        gfx_rect(mx, my, 1, mon_sz);
+        gfx_rect(mx+mon_sz-1, my, 1, mon_sz);
+        spk_icon_sz = mon_sz * 0.5;
+        spk_icon_x = mx + (mon_sz - spk_icon_sz) * 0.5;
+        spk_icon_y = my + (mon_sz - spk_icon_sz) * 0.5;
+        draw_speaker_clean(spk_icon_x, spk_icon_y, spk_icon_sz, spk_icon_sz);
       );
-      gfx_rect(mx, my, mon_sz, 1);
-      gfx_rect(mx, my+mon_sz-1, mon_sz, 1);
-      gfx_rect(mx, my, 1, mon_sz);
-      gfx_rect(mx+mon_sz-1, my, 1, mon_sz);
-      spk_icon_sz = mon_sz * 0.5;
-      spk_icon_x = mx + (mon_sz - spk_icon_sz) * 0.5;
-      spk_icon_y = my + (mon_sz - spk_icon_sz) * 0.5;
-      draw_speaker_clean(spk_icon_x, spk_icon_y, spk_icon_sz, spk_icon_sz);
 
     ) : (
       wantr = 0;
@@ -2952,30 +2992,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     // Sub-controls: CH, REC/PLY, PLY/STP, REV, UNDO, CLR, advanced SEL/RDC/DIV/FAD, MON, speaker
     t = mem_stlist + i * st_num;
     t_ypos = row_cy - (tweaker_h / 2)|0;
-    // Partner lanes in a linked pair show a "linked" label instead of independent controls.
-    is_linked_idx(i) && (i & 1) ? (
-      wantr ? (
-        gfx_set(0.18, 0.18, 0.28);
-        ch_x >= 0 ? gfx_rect(ch_x, t_ypos, tweaker_w, tweaker_h);
-        rec_x >= 0 ? gfx_rect(rec_x, t_ypos, tweaker_w, tweaker_h);
-        ply_x >= 0 ? gfx_rect(ply_x, t_ypos, tweaker_w, tweaker_h);
-        rev_x >= 0 ? gfx_rect(rev_x, t_ypos, tweaker_w, tweaker_h);
-        undo_x >= 0 ? gfx_rect(undo_x, t_ypos, tweaker_w, tweaker_h);
-        clr_x >= 0 ? gfx_rect(clr_x, t_ypos, tweaker_w, tweaker_h);
-        sel_x >= 0 ? gfx_rect(sel_x, t_ypos, tweaker_w, tweaker_h);
-        mon_btn_x >= 0 ? gfx_rect(mon_btn_x, t_ypos, tweaker_w, tweaker_h);
-        rdc_x >= 0 ? gfx_rect(rdc_x, t_ypos, tweaker_w, tweaker_h);
-        div_x >= 0 ? gfx_rect(div_x, t_ypos, tweaker_w, tweaker_h);
-        fad_x >= 0 ? gfx_rect(fad_x, t_ypos, tweaker_w, tweaker_h);
-        gfx_set(0.38, 0.38, 0.55);
-        gfx_setfont(1,"Arial",9);
-        gfx_measurestr("linked",tw,th);
-        gfx_x = max(rec_x, 0) + (tweaker_w - tw) * 0.5;
-        gfx_y = t_ypos + (tweaker_h - th) * 0.5;
-        gfx_drawstr("linked");
-        gfx_setfont(0);
-      );
-    ) : (
+    // Partner lane in a linked pair: tweakers completely hidden; Lane A tweakers drop to Lane B centre.
+    !(is_linked_idx(i) && (i & 1)) ? (
       ch_x >= 0 ? draw_value_tweaker(ch_x, t_ypos, t + st_midichan, wantr, "CH");
       rec_x >= 0 ? draw_value_tweaker(rec_x, t_ypos, t + st_note1, wantr,
               rec[st_state]==2 && !g_firstrec ? "PLY" : "REC");
@@ -3038,6 +3056,35 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
         // Unlinked: leave gap — no bar, rings appear broken apart
         set_color(C_BG_BASE);
         gfx_rect((link_cx - 2)|0, (link_cy - 1)|0, 5, 3);
+      );
+      // Linked pair: draw Lane A's monitor at the boundary, on top of both backgrounds.
+      // Uses rec - st_num to read Lane A's state. Mirrors Lane B's wantr so redraws
+      // are synchronised with the rest of the pair's redraw cycle.
+      t ? (
+        rec_a = rec - st_num;
+        mx = mon_x;
+        my = row_y - (mon_sz/2)|0;
+        rec_a[st_monmode] > 0 ? (
+          rec_a[st_state] >= 2 ? set_color(C_LANE_REC) :
+          rec_a[st_state] == 1 ? set_color(C_LANE_PLAY) :
+                                 set_color(C_LANE_STOP_CONT);
+          gfx_rect(mx, my, mon_sz, mon_sz);
+          rec_a[st_state] >= 2 ? set_color(C_MON_REC_FG) :
+          rec_a[st_state] == 1 ? set_color(C_MON_PLAY_FG) :
+                                 set_color(C_MON_STOP_FG);
+        ) : (
+          set_color(C_MON_OFF_BG);
+          gfx_rect(mx, my, mon_sz, mon_sz);
+          set_color(C_MON_OFF_FG);
+        );
+        gfx_rect(mx, my, mon_sz, 1);
+        gfx_rect(mx, my+mon_sz-1, mon_sz, 1);
+        gfx_rect(mx, my, 1, mon_sz);
+        gfx_rect(mx+mon_sz-1, my, 1, mon_sz);
+        spk_icon_sz = mon_sz * 0.5;
+        spk_icon_x = mx + (mon_sz - spk_icon_sz) * 0.5;
+        spk_icon_y = my + (mon_sz - spk_icon_sz) * 0.5;
+        draw_speaker_clean(spk_icon_x, spk_icon_y, spk_icon_sz, spk_icon_sz);
       );
     );
 
@@ -3162,7 +3209,7 @@ function draw_pill_toggle(xp, yp, label, is_on)
   // Status dot
   is_on ? set_color(C_PILL_ON_DOT) : set_color(C_PILL_OFF_DOT);
   gfx_circle(x + 4 + lw + gap_inner + dot_sz * 0.5, y + total_h * 0.5, dot_sz * 0.5, 1, 1);
-  gfx_x = x + total_w + 5;
+  gfx_x = x + total_w + 8;
   gfx_setfont(0);
 );
 
@@ -3192,7 +3239,7 @@ function draw_pill_value(xp, yp, label, valstr)
   set_color(C_PILL_VALUE);
   gfx_x = x + 5 + lw + sep; gfx_y = y + (total_h - vh) * 0.5;
   gfx_drawstr(valstr);
-  gfx_x = x + total_w + 5;
+  gfx_x = x + total_w + 8;
   gfx_setfont(0);
 );
 
@@ -3213,14 +3260,14 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
 
   need_ref ? (
     set_color(C_BG_TOPBAR);
-    gfx_rect(0, 0, gfx_w, 30);
+    gfx_rect(0, 0, gfx_w, 34);
     set_color(0x202030);  // separator line
-    gfx_rect(0, 29, gfx_w, 1);
+    gfx_rect(0, 33, gfx_w, 1);
 
     gfx_x = 60;
 
     lastsync = cfgp_sync[];
-    projsync_button.draw_pill_value(gfx_x + 4, 2,
+    projsync_button.draw_pill_value(gfx_x + 4, 6,
       "SYNC", lastsync == 2 ? "PLAY" : lastsync == 0 ? "OFF" : "PROJ");
 
     lastlen = g_length;
@@ -3229,27 +3276,27 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
     lastvclickoffs = cfgp_vclick[];
 
     lastsync == 0 ? (
-      offs_button.draw_pill_value(gfx_x + 4, 2, "OFFSETS", sprintf(#, "%.0f", g_offs));
-      length_button.draw_pill_value(gfx_x + 4, 2, "SPLS", sprintf(#, "%.0f", g_length));
+      offs_button.draw_pill_value(gfx_x + 4, 6, "OFFSETS", sprintf(#, "%.0f", g_offs));
+      length_button.draw_pill_value(gfx_x + 4, 6, "SPLS", sprintf(#, "%.0f", g_length));
     );
 
     lastclickcount = cfgp_clickcnt[] | 0;
 
-    clickcnt_button.draw_pill_value(gfx_x + 4, 2,
+    clickcnt_button.draw_pill_value(gfx_x + 4, 6,
       lastsync ? "LENGTH" : "CLK CNT",
       lastsync ? (lastclickcount == 0 ? "MEAS" : sprintf(#, "%d", lastclickcount))
                : sprintf(#, "%d", lastclickcount));
 
-    lastclickcount > 0 || lastsync ? vclick_button.draw_pill_value(gfx_x + 4, 2,
+    lastclickcount > 0 || lastsync ? vclick_button.draw_pill_value(gfx_x + 4, 6,
       "VCLICK", lastvclickoffs > 0 ? sprintf(#, "+%.1f", lastvclickoffs) : "OFF");
 
-    lastsync == 0 ? gate_button.draw_pill_value(gfx_x + 4, 2,
+    lastsync == 0 ? gate_button.draw_pill_value(gfx_x + 4, 6,
       "GATE", cfgp_gate[] < g_infthreshdb ? "-inf" : sprintf(#, "%.0fdB", lastgate));
 
-    latch_button.draw_pill_toggle(gfx_x + 4, 2, "LATCH", (lastlatch = g_latchmode));
-    flex_button.draw_pill_toggle(gfx_x + 4, 2, "FLEX", (last_flex = g_flex_enabled));
-    advanced_button.draw_pill_toggle(gfx_x + 4, 2, "CTRL", (last_show_advanced = g_show_advanced));
-    pulse_button.draw_pill_toggle(gfx_x + 4, 2, "PULSE", (last_pulse = (g_sysex_period_rate > 0)));
+    latch_button.draw_pill_toggle(gfx_x + 4, 6, "LATCH", (lastlatch = g_latchmode));
+    flex_button.draw_pill_toggle(gfx_x + 4, 6, "FLEX", (last_flex = g_flex_enabled));
+    advanced_button.draw_pill_toggle(gfx_x + 4, 6, "SHOW CONTROLS", (last_show_advanced = g_show_advanced));
+    pulse_button.draw_pill_toggle(gfx_x + 4, 6, "PULSE", (last_pulse = (g_sysex_period_rate > 0)));
   );
 
   (mouse_cap&1) && !(mouse_cap&2) ? (
@@ -3265,8 +3312,7 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
       ) : advanced_button.hit_topbar_button(mouse_x,mouse_y,-1) ? (
         g_show_advanced = !g_show_advanced;
         // Globals bar is shown/hidden together with CTRL
-        g_show_globals = g_show_advanced;
-        mem_gen_cfg[23] = g_show_globals;
+        // g_show_globals is always 1 -- CTRL no longer controls common-mode dispatch
         mem_gen_cfg[24] = g_show_advanced;
         sliderchange(-1); // persist to @serialize
         last_w = 0;       // force full redraw to show/hide advanced controls + globals
@@ -3439,8 +3485,8 @@ function draw_trim_waveform(xpos, ypos, w, h, chan, isend)
 
   gfx_a = 1;  // reset alpha corrupted by PR lib shadow in previous frame
   draw_topbar(last_w != gfx_w || last_h != gfx_h);
-  draw_position(30);
-  draw(0, 52);
+  draw_position(34);
+  draw(0, 56);
   
   gfx_x=0;
   gfx_y=gfx_h-8;
