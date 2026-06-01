@@ -1193,7 +1193,7 @@ function build_sysex_snapshot()
 
     lane_dirty      = rec[st_dirty] > 0 ? 1 : 0;
     lane_sel        = (g_chan_selected == i) ? 1 : 0;
-    lane_rev_active = (<? loop(x=0;nch, printf("i==%d?ch%d.rev_active:\n",x,x+1)) ?> 0) & 0x01;
+    lane_rev_active = (<? loop(x=0;nch, printf("i==%d?ch%d.rev_active:\n",x,x+1); x+=1) ?> 0) & 0x01;
 
     // undo_redo_state (2-bit, packed into bits 4:3 of lane_info byte):
     //   0 = neither available
