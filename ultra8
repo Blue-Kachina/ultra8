@@ -3634,7 +3634,7 @@ function lcm(a, b) local(g) ( g = gcd(a|0, b|0); g > 0 ? (a|0) / g * (b|0) : 0; 
 // exported sample corresponds to global beat-0.  The first rep is split into a
 // tail chunk [rotation..l-1] then a head chunk [0..rotation-1]; subsequent reps
 // are exported whole.  In non-Flex mode g_offs fills the same role.
-function export()  local(rec, flag, tidx, idx, ster, l, total_len, reps, rotation, ch2off)
+function export()  local(rec, first_flag, tidx, idx, ster, l, total_len, reps, rotation, ch2off)
 (
   // ── Step 1: LCM total duration across all active lane lengths ──────────────────────────
   total_len = 0;
@@ -3654,7 +3654,9 @@ function export()  local(rec, flag, tidx, idx, ster, l, total_len, reps, rotatio
 
   total_len > 0 ? (
     rec = mem_stlist;
-    flag = (1<<16)|(2<<16); // go to end of project; use custom tempo
+    // first_flag: consumed once by the very first export call (positions at project
+    // end and sets tempo).  Reps 2+ use 1<<16 (after last item on this track).
+    first_flag = (1<<16)|(2<<16);
     tidx = idx = 0;
 
     loop(g_nchan,
@@ -3681,23 +3683,25 @@ function export()  local(rec, flag, tidx, idx, ster, l, total_len, reps, rotatio
             rotation > 0 ? (
               // First rep split: tail [rotation … l-1] then head [0 … rotation-1]
               export_buffer_to_project(rec[st_buf]+rotation, l-rotation,
-                ster>=0?2:1, srate, tidx, flag,
-                flag?(cfgp_sync[]?tempo:estbpm(g_length)):0, ch2off);
-              flag = 0;
+                ster>=0?2:1, srate, tidx, first_flag,
+                first_flag?(cfgp_sync[]?tempo:estbpm(g_length)):0, ch2off);
+              first_flag = 0;
+              // head of first rep + all subsequent reps append to this track
               export_buffer_to_project(rec[st_buf], rotation,
-                ster>=0?2:1, srate, tidx, 0, 0, ch2off);
-              // Remaining reps-1 full copies
+                ster>=0?2:1, srate, tidx, 1<<16, 0, ch2off);
               loop(reps-1,
                 export_buffer_to_project(rec[st_buf], l,
-                  ster>=0?2:1, srate, tidx, 0, 0, ch2off);
+                  ster>=0?2:1, srate, tidx, 1<<16, 0, ch2off);
               );
             ) : (
-              // No rotation needed: tile reps straight copies
-              loop(reps,
+              // No rotation: first rep at cursor/end, reps 2+ append to track
+              export_buffer_to_project(rec[st_buf], l,
+                ster>=0?2:1, srate, tidx, first_flag,
+                first_flag?(cfgp_sync[]?tempo:estbpm(g_length)):0, ch2off);
+              first_flag = 0;
+              loop(reps-1,
                 export_buffer_to_project(rec[st_buf], l,
-                  ster>=0?2:1, srate, tidx, flag,
-                  flag?(cfgp_sync[]?tempo:estbpm(g_length)):0, ch2off);
-                flag = 0;
+                  ster>=0?2:1, srate, tidx, 1<<16, 0, ch2off);
               );
             );
           );
