@@ -106,13 +106,13 @@ g_latchmode=0;
 
 // per-channel state/configuration record (mem_stlist)
 st_monmode = 0; // mirrors chX.monmode
-st_note1 = 1; // mirrors chX.note/chX.note2/chX.note3/chX.note4
-st_note2 = 2;
-st_note3 = 3;
-st_note4 = 4; // reverse note
-st_note5 = 17; // clear lane
-st_note6 = 18; // undo lane
-st_note7 = 19; // monitor two-state toggle
+st_note_recply = 1; // mirrors chX.note/chX.note2/chX.note3/chX.note4
+st_note_plystp = 2;
+st_note_sel = 3;
+st_note_rev = 4; // reverse note
+st_note_clr = 17; // clear lane
+st_note_undo = 18; // undo lane
+st_note_mon = 19; // monitor two-state toggle
 
 st_state = 5; // 0=off, 1=play, 2=recording
 st_buf   = 6; // pointer to audio buffer
@@ -137,6 +137,26 @@ st_loop_phase    = 25; // g_flex_pos value at which this lane's buffer position 
 // ─────────────────────────────────────────────────────────────────────────────
 st_num = 26;
 
+// ── Command dispatch constants (Phase 2) ─────────────────────────────────────
+// CMD_* — logical looper actions, independent of how they were triggered.
+// Pass to execute_lane_command(cmd, lane_idx, source).
+CMD_RECPLY    = 1;  // REC/PLY toggle
+CMD_PLYSTP    = 2;  // PLY/STP toggle
+CMD_CLR       = 3;  // clear lane(s)
+CMD_UNDO_REDO = 4;  // UNDO if no redo available, REDO otherwise
+CMD_REV       = 5;  // reverse toggle
+CMD_MON       = 6;  // two-state monitor toggle
+CMD_SEL       = 7;  // select lane (special: translates to per-lane inject)
+CMD_PLAY_ALL  = 8;  // play-all / stop-all
+
+// SRC_* — where the command originated. Reserved for future logging / throttling.
+SRC_MIDI_COMMON = 1;  // common-mode MIDI dispatch (channel-per-lane)
+SRC_MIDI_LANE   = 2;  // per-lane MIDI assignment
+SRC_UI          = 3;  // mouse click in @gfx
+SRC_LATCH       = 4;  // dequeued from the latch queue
+// ─────────────────────────────────────────────────────────────────────────────
+
+
 function recalc_fades() (
   g_fadespeed = exp(-1/(srate * 0.002));  // fade speed for monitoring
   g_slope_recin = 1/(srate * 0.001); // fade length for starting rec
@@ -153,13 +173,13 @@ function alloc(sz) ( (this.top+=sz)-sz; );
 
 function updatefromrec() instance(rec)
 (
-  this.note  = rec[st_note1];
-  this.note2 = rec[st_note2];
-  this.note3 = rec[st_note3];
-  this.note4 = rec[st_note4];
-  this.note5 = rec[st_note5];
-  this.note6 = rec[st_note6];
-  this.note7 = rec[st_note7];
+  this.note  = rec[st_note_recply];
+  this.note2 = rec[st_note_plystp];
+  this.note3 = rec[st_note_sel];
+  this.note4 = rec[st_note_rev];
+  this.note5 = rec[st_note_clr];
+  this.note6 = rec[st_note_undo];
+  this.note7 = rec[st_note_mon];
   this.monmode = rec[st_monmode];
   this.rdc =(rec[st_rdc]*.001*srate+.5)|0;
   this.div = 1 / rec[st_div];
@@ -174,13 +194,13 @@ function init(x, n1,n2,n3)
   buf = alloc(g_maxlen);
 
   rec = mem_stlist + x*st_num;
-  rec[st_note1] = n1;
-  rec[st_note2] = n2;
-  rec[st_note3] = n3;
-  rec[st_note4] = 128;
-  rec[st_note5] = 128; // CLR default off
-  rec[st_note6] = 128; // UNDO default off
-  rec[st_note7] = 128; // MON default off
+  rec[st_note_recply] = n1;
+  rec[st_note_plystp] = n2;
+  rec[st_note_sel] = n3;
+  rec[st_note_rev] = 128;
+  rec[st_note_clr] = 128; // CLR default off
+  rec[st_note_undo] = 128; // UNDO default off
+  rec[st_note_mon] = 128; // MON default off
   rec[st_state]=0;
   rec[st_lastd]=-1;
   rec[st_dirty]=0;
@@ -415,11 +435,46 @@ function get_lane_waveform_display_len(idx, rec) local(wl) (
   wl;
 );
 
+// Returns the waveform start-offset (in samples) for lane idx.
+// In classic mode: g_offs % wl (matches the legacy Super8 behavior).
+// In Flex mode:    0 — each lane's playback uses st_loop_phase, not g_offs,
+//                      so offsetting the waveform by g_offs would be incorrect.
+// wl = the waveform display length (e.g. from get_lane_waveform_display_len).
+function get_lane_waveform_start_offset(wl) (
+  is_flex_mode() ? 0 : (wl > 0 ? g_offs % wl : 0);
+);
+
 // Returns the committed length multiple relative to the Flex base.
 // Returns 0 for empty lanes or when no base exists.
 function get_lane_length_multiple(idx) local(ll) (
   (g_flex_base_len > 0 && (ll = get_effective_loop_len(idx)) > 0) ?
     (ll / g_flex_base_len + 0.5) | 0 : 0;
+);
+
+// Validates and repairs per-lane Flex metadata for internal consistency.
+// Call after clear, reset, or @serialize restore to ensure the Flex
+// invariants hold before audio processing resumes:
+//   1. st_loop_len must be 0 for empty lanes (st_dirty == 0).
+//   2. st_loop_phase must be 0 for empty lanes.
+//   3. st_loop_len must be <= g_maxlen.
+//   4. Undo/redo loop lengths are clamped to g_maxlen.
+// This function does NOT call recalc_flex_base_len() — callers must do that
+// afterward if base length may have changed.
+function validate_flex_state() local(lp) (
+  lp = mem_stlist;
+  loop(g_nchan,
+    // Rule 1/2: empty lane must have zeroed Flex metadata.
+    lp[st_dirty] == 0 ? (
+      lp[st_loop_len]   = 0;
+      lp[st_loop_phase] = 0;
+    );
+    // Rule 3: clamp loop length to buffer capacity.
+    lp[st_loop_len] > g_maxlen ? lp[st_loop_len] = g_maxlen;
+    // Rule 4: clamp undo/redo loop lengths.
+    lp[st_undo_loop_len] > g_maxlen ? lp[st_undo_loop_len] = 0;
+    lp[st_redo_loop_len] > g_maxlen ? lp[st_redo_loop_len] = 0;
+    lp += st_num;
+  );
 );
 
 // Re-derive g_flex_base_len from the minimum non-zero st_loop_len across all
@@ -900,26 +955,26 @@ function onmsg(m1,m2,m3) instance(rec,note,note2,note3,note4,note5,note6,note7)
 (
   // Per-lane mode (globals off): gate on MIDI channel so only the lane whose
   // st_midichan matches the incoming channel responds.  UI-injected commands
-  // (m2 >= 1024) and common-mode (g_show_globals) bypass this filter — they
+  // (m2 >= 1024) and common-mode (g_show_globals is always 1) bypass this filter — they
   // have already been channel-resolved upstream.
   m2 >= 1024 || g_show_globals || g_msg_chan == rec[st_midichan] ? (
    newstate = -1;
-   (m2 == note && (m2 != note2 || rec[st_state]==0)) || m2 == 1024+rec+st_note1 ? (
+   (m2 == note && (m2 != note2 || rec[st_state]==0)) || m2 == 1024+rec+st_note_recply ? (
      newstate = (rec[st_state] == 2 && g_was_firstrec==0) ? 1 : 2;
-   ) : m2 == note2  || m2 == 1024+rec+st_note2 ? (
+   ) : m2 == note2  || m2 == 1024+rec+st_note_plystp ? (
      newstate = rec[st_state] == 2 || (rec[st_state]==0 && g_length) ? 1 : 0
-   ) : (m2 == note3 || m2 == 1024+rec+st_note3) ? (
+   ) : (m2 == note3 || m2 == 1024+rec+st_note_sel) ? (
      g_chan_selected = is_chan_selected(this.idx) ? -1 : pair_owner_idx(this.idx);
-   ) : m2 == note4 || m2 == 1024+rec+st_note4 ? (
+   ) : m2 == note4 || m2 == 1024+rec+st_note_rev ? (
      reverse_pair(this.idx);
-   ) : m2 == note5 || m2 == 1024+rec+st_note5 ? (
+   ) : m2 == note5 || m2 == 1024+rec+st_note_clr ? (
      g_lane_clear_req = this.idx + 1;
-   ) : m2 == note6 || m2 == 1024+rec+st_note6 ? (
+   ) : m2 == note6 || m2 == 1024+rec+st_note_undo ? (
      // Unit 2.1: toggle — REDO if available, otherwise UNDO
      rec[st_redo_len] > 0 ?
        g_lane_redo_req = this.idx + 1 :
        g_lane_undo_req = this.idx + 1;
-   ) : m2 == note7 || m2 == 1024+rec+st_note7 ? (
+   ) : m2 == note7 || m2 == 1024+rec+st_note_mon ? (
      g_lane_mon_req = this.idx + 1;
    );
    newstate >= 0 ? (
@@ -1016,9 +1071,11 @@ function undo_pair(idx) local(oidx pidx orec prec) (
   pidx = pair_partner_idx(oidx);
   orec = mem_stlist + oidx * st_num;
   orec[st_undo_len] > 0 ? (
-    // Save current state to redo buffer before overwriting.
-    memcpy(orec[st_redo_buf], orec[st_buf], orec[st_undo_len]);
-    orec[st_redo_len]      = orec[st_undo_len];
+    // Save current (post-overdub) state to redo buffer before overwriting.
+    // Use st_dirty — not st_undo_len — to capture any extra samples written
+    // during the overdub (e.g. Flex mode may change the dirty length).
+    memcpy(orec[st_redo_buf], orec[st_buf], orec[st_dirty]);
+    orec[st_redo_len]      = orec[st_dirty];
     orec[st_redo_loop_len] = orec[st_loop_len]; // Phase 7: save current Flex length to redo
     // Restore from undo snapshot.
     memcpy(orec[st_buf], orec[st_undo_buf], orec[st_undo_len]);
@@ -1029,8 +1086,8 @@ function undo_pair(idx) local(oidx pidx orec prec) (
   pidx >= 0 ? (
     prec = mem_stlist + pidx * st_num;
     prec[st_undo_len] > 0 ? (
-      memcpy(prec[st_redo_buf], prec[st_buf], prec[st_undo_len]);
-      prec[st_redo_len]      = prec[st_undo_len];
+      memcpy(prec[st_redo_buf], prec[st_buf], prec[st_dirty]);
+      prec[st_redo_len]      = prec[st_dirty];
       prec[st_redo_loop_len] = prec[st_loop_len];
       memcpy(prec[st_buf], prec[st_undo_buf], prec[st_undo_len]);
       prec[st_dirty]    = prec[st_undo_len];
@@ -1094,6 +1151,36 @@ function common_mon_pair(idx) local(oidx pidx orec prec newmode) (
   updatechfromrec();
   g_mon_changed = 1;
   g_sysex_dirty = 1; // Unit 3.4: monmode changed; schedule snapshot
+);
+
+// ── Central command executor (Phase 2) ──────────────────────────────────────
+// All looper commands — from MIDI, UI, or latch queue — should pass through
+// this function. It resolves the pair owner and dispatches to the appropriate
+// pair-aware helper.
+// cmd:      one of the CMD_* constants above
+// lane_idx: any lane index (owner or partner — pair_owner_idx normalises it)
+// source:   one of the SRC_* constants (informational; not used for routing yet)
+//
+// Callers that need latch-queue support must check g_latchmode and call
+// latchq_add() themselves BEFORE calling this function, because the latch
+// queue stores raw MIDI bytes and cannot yet store CMD_* payloads directly.
+// (That migration is a future step; for now only common-mode callers latch.)
+//
+// CMD_SEL is special: it does not call a pair-aware helper directly but
+// injects a translated note into the MIDI stream via nextmsg_2 / common_dispatch.
+// The caller must set those fields itself; execute_lane_command is a no-op for SEL.
+function execute_lane_command(cmd, lane_idx, source) (
+  cmd == CMD_RECPLY    ? common_recply_pair(lane_idx) :
+  cmd == CMD_PLYSTP    ? common_plystp_pair(lane_idx) :
+  cmd == CMD_CLR       ? clear_pair(lane_idx) :
+  cmd == CMD_UNDO_REDO ? (
+    (mem_stlist + pair_owner_idx(lane_idx) * st_num)[st_redo_len] > 0 ?
+      redo_pair(lane_idx) : undo_pair(lane_idx);
+  ) :
+  cmd == CMD_REV       ? reverse_pair(lane_idx) :
+  cmd == CMD_MON       ? common_mon_pair(lane_idx) :
+  cmd == CMD_PLAY_ALL  ? play_or_stop_all() :
+  0; // CMD_SEL and unknown commands: no-op here; caller handles
 );
 
 function reset() local(lp)
@@ -1316,22 +1403,22 @@ function build_assign_snapshot()
   g_snap_sel = (g_chan_selected >= 0 ? g_chan_selected : 0) * st_num + mem_stlist;
 
   g_assign_buf[7]  = 0;   // Control 0: REC_PLY — control_id
-  decode_assignment(g_snap_sel[st_note1], g_assign_buf, 8);
+  decode_assignment(g_snap_sel[st_note_recply], g_assign_buf, 8);
 
   g_assign_buf[10] = 1;   // Control 1: PLY_STP — control_id
-  decode_assignment(g_snap_sel[st_note2], g_assign_buf, 11);
+  decode_assignment(g_snap_sel[st_note_plystp], g_assign_buf, 11);
 
   g_assign_buf[13] = 2;   // Control 2: CLR — control_id
-  decode_assignment(g_snap_sel[st_note5], g_assign_buf, 14);
+  decode_assignment(g_snap_sel[st_note_clr], g_assign_buf, 14);
 
   g_assign_buf[16] = 3;   // Control 3: MON — control_id
-  decode_assignment(g_snap_sel[st_note7], g_assign_buf, 17);
+  decode_assignment(g_snap_sel[st_note_mon], g_assign_buf, 17);
 
   g_assign_buf[19] = 4;   // Control 4: UNDO_REDO — control_id
-  decode_assignment(g_snap_sel[st_note6], g_assign_buf, 20);
+  decode_assignment(g_snap_sel[st_note_undo], g_assign_buf, 20);
 
   g_assign_buf[22] = 5;   // Control 5: REV — control_id
-  decode_assignment(g_snap_sel[st_note4], g_assign_buf, 23);
+  decode_assignment(g_snap_sel[st_note_rev], g_assign_buf, 23);
 
   // ── SysEx end (byte 25) ─────────────────────────────────────────────────────
   g_assign_buf[25] = 0xF7;
@@ -1397,7 +1484,7 @@ ext_noinit == 0 ? (
   cfgp_common_undo = mem_gen_cfg + 22;
   cfgp_common_rev  = mem_gen_cfg + 28;
   mem_gen_cfg[23]  = 0; // g_show_globals: unused (always forced to 1 at runtime; common-mode dispatch is always on)
-  mem_gen_cfg[24]  = 0; // g_show_advanced: Advanced controls off by default
+  mem_gen_cfg[24]  = 0; // g_show_controls: Advanced controls off by default
   mem_gen_cfg[29]  = 0; // g_pulse: SysEx heartbeat off by default (QoL 1.1)
   cfgp_common_rdc  = mem_gen_cfg + 25;
   cfgp_common_div  = mem_gen_cfg + 26;
@@ -1433,8 +1520,12 @@ ext_noinit == 0 ? (
 
   g_inject_midinote = 0;
   g_ui_dispatch = 0;  // set to 1 when a UI-injected command is pre-loaded, so it bypasses the common-mode gate
-  g_show_globals = 1;       // Common-mode MIDI dispatch always on (g_show_advanced drives UI visibility)
-  g_show_advanced = 0;      // Advanced controls off by default (synced from mem_gen_cfg[24] after serialize)
+  // g_show_globals is ALWAYS forced to 1. It is not a real toggle — it is a
+  // compatibility flag from an earlier design where common dispatch could be
+  // disabled. Today it simply means "common-mode MIDI dispatch is active"; the
+  // UI visibility toggle is g_show_controls (formerly g_show_advanced).
+  g_show_globals = 1;       // permanent; never set to 0
+  g_show_controls = 0;      // Advanced controls off by default (synced from mem_gen_cfg[24] after serialize)
   g_lane_clear_req = 0;
   g_lane_undo_req = 0;
   g_lane_redo_req = 0; // Unit 2.1
@@ -1509,11 +1600,23 @@ ext_noinit == 0 ? (
   //   st_midichan (default 1–8), so these CCs cannot trigger any lane action.
   // CC 100–107 remap to note 229–236 in @sample — no Ultra8 assignment uses these.
   // Set g_dbg_fb_enabled = 0 to silence the emitter without removing the code.
-  g_dbg_fb_enabled  = 1;
+  g_dbg_fb_enabled  = 0;  // PRODUCTION DEFAULT: 0. Set to 1 to emit per-lane state CCs on ch16.
   g_dbg_fb_chan     = 15;  // 0-indexed → MIDI channel 16
   g_dbg_fb_cc_base  = 100; // CC 100 = lane 0, CC 101 = lane 1, …
   g_dbg_fb_last     = alloc(g_nchan);
   memset(g_dbg_fb_last, 255, g_nchan); // 255 = "not yet emitted" → force first emit
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── Production vs development defaults ─────────────────────────────────────
+  // See docs/sysex_production_config.md for the full configuration reference.
+  // PRODUCTION defaults (ship with these):
+  //   g_sysex_enabled       = 1   master gate — always on for NANO4 rigs
+  //   g_sysex_debug_enabled = 0   verbose console logging OFF
+  //   g_sysex_period_rate   = 0   heartbeat OFF (user enables via PULSE button)
+  //   g_dbg_fb_enabled      = 0   debug CC emitter OFF
+  // DEVELOPMENT overrides (revert before commit):
+  //   g_sysex_debug_enabled = 1   prints ~120 chars/packet to Reaper console
+  //   g_dbg_fb_enabled      = 1   emits CC 100-107 on ch16 for state tracing
   // ─────────────────────────────────────────────────────────────────────────────
 
   // ── SysEx Snapshot Builder — init (Units 3.3 / 3.4) ─────────────────────────
@@ -1524,7 +1627,7 @@ ext_noinit == 0 ? (
   // g_sysex_dirty:         set to 1 by setstate/undo_pair/common_mon_pair; @block
   //                        emits one snapshot per block when set, then clears it
   g_sysex_enabled       = 1;
-  g_sysex_debug_enabled = 1;   // set to 0 in production
+  g_sysex_debug_enabled = 0;   // PRODUCTION DEFAULT: 0. Set to 1 to printf each SysEx packet.
   g_sysex_seq           = 0;
   g_sysex_buf           = alloc(33);
   g_sysex_dirty         = 0;
@@ -1539,7 +1642,7 @@ ext_noinit == 0 ? (
   // g_assign_seq:    separate 14-bit counter from g_sysex_seq; 0 on boot; first
   //                  emitted packet = seq 1 (incremented before each emit)
   // g_assign_buf:    26-float alloc block; one slot per MIDI byte (6 controls)
-  // g_assign_shadow: 6-float shadow of per-lane st_note1/2/5/7/6/4 for the
+  // g_assign_shadow: 6-float shadow of per-lane st_note_recply/2/5/7/6/4 for the
   //                  currently selected lane (g_chan_selected), used by @block
   //                  to detect assignment changes between heartbeats.  Covers
   //                  both global header-row tweakers and per-lane row tweakers.
@@ -1597,16 +1700,16 @@ function doconf() local(i,s) (
 
   i = mem_stlist;
   loop(g_nchan,
-    file_var(0,i[st_note1]);
-    file_var(0,i[st_note2]);
-    file_var(0,i[st_note3]);
+    file_var(0,i[st_note_recply]);
+    file_var(0,i[st_note_plystp]);
+    file_var(0,i[st_note_sel]);
     i+=st_num;
   );
 
   file_avail(0) != 0 ? (
     i = mem_stlist;
     loop(g_nchan,
-      file_var(0,i[st_note4]);
+      file_var(0,i[st_note_rev]);
       i+=st_num;
     );
   );
@@ -1633,9 +1736,9 @@ function doconf() local(i,s) (
   file_avail(0) != 0 ? ( // added lane MIDI assignments: CLR, UNDO, MON (appended for backward compat)
     i = mem_stlist;
     loop(g_nchan,
-      file_var(0,i[st_note5]);
-      file_var(0,i[st_note6]);
-      file_var(0,i[st_note7]);
+      file_var(0,i[st_note_clr]);
+      file_var(0,i[st_note_undo]);
+      file_var(0,i[st_note_mon]);
       i+=st_num;
     );
   );
@@ -1660,22 +1763,16 @@ function doconf() local(i,s) (
     g_latchmode = cfgp_latch[];
     g_slider_click_cnt = cfgp_clickcnt[]|0;
     g_show_globals = 1; // common-mode MIDI dispatch always on - not toggled by CTRL
-    g_show_advanced = mem_gen_cfg[24]; // restore Advanced toggle from saved state
+    g_show_controls = mem_gen_cfg[24]; // restore Advanced toggle from saved state
     g_sysex_period_rate = mem_gen_cfg[29] ? 1.0 : 0; // restore Pulse toggle from saved state
 
-    // Phase 1: after loading, re-derive g_flex_base_len from the smallest non-zero
-    // st_loop_len if Flex Mode is enabled.  The base length is not stored directly;
-    // it equals the shortest committed lane length (i.e. the first-recorded lane).
-    // This ensures click generation and latch logic see a consistent base after reload.
+    // Phase 1 + Phase 3 hardening: validate and repair Flex metadata, then
+    // re-derive g_flex_base_len from the smallest non-zero st_loop_len.
+    // validate_flex_state() corrects any inconsistencies introduced by e.g.
+    // clearing lanes or loading an older project file.
+    validate_flex_state();
     g_flex_enabled ? (
-      g_flex_base_len = 0;
-      i = mem_stlist;
-      loop(g_nchan,
-        (i[st_loop_len] > 0 && (g_flex_base_len == 0 || i[st_loop_len] < g_flex_base_len)) ? (
-          g_flex_base_len = i[st_loop_len];
-        );
-        i += st_num;
-      );
+      recalc_flex_base_len();
     );
 
     last_w=0;
@@ -1749,6 +1846,18 @@ function onblock()
 
 <? loop(x=0;nch, printf("ch%d.onblock();\n",x+=1)) ?>
 
+// ── Flex max-buffer auto-commit (Phase 3 hardening) ─────────────────────────
+// When a Flex empty-lane recording fills the entire buffer, process() freezes
+// the write pointer but cannot commit (setstate is not safe from @sample).
+// Check here each block: if we are at the limit, commit and enter playback.
+is_flex_mode() && g_flex_rec_owner_idx >= 0 && g_flex_rec_raw_len >= g_maxlen ? (
+  flex_commit_empty_lane_recording(g_flex_rec_owner_idx, g_maxlen);
+  setstate_pair(g_flex_rec_owner_idx, 1); // enter playback
+  g_flex_rec_owner_idx = -1;
+  g_flex_rec_raw_len   = 0;
+);
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ── Debug feedback emitter (Unit 2.2) ────────────────────────────────────────
 // Fires once per audio block; emits a CC only when a lane's state has changed.
 g_dbg_fb_enabled ? (
@@ -1795,18 +1904,18 @@ g_sysex_enabled && g_sysex_dirty ? (
 // The heartbeat path (below) still emits every period for reconnect recovery.
 g_sysex_enabled ? (
   g_eff_sel = (g_chan_selected >= 0 ? g_chan_selected : 0) * st_num + mem_stlist;
-  (g_eff_sel[st_note1] != g_assign_shadow[0] ||
-   g_eff_sel[st_note2] != g_assign_shadow[1] ||
-   g_eff_sel[st_note5] != g_assign_shadow[2] ||
-   g_eff_sel[st_note7] != g_assign_shadow[3] ||
-   g_eff_sel[st_note6] != g_assign_shadow[4] ||
-   g_eff_sel[st_note4] != g_assign_shadow[5]) ? (
-    g_assign_shadow[0] = g_eff_sel[st_note1];
-    g_assign_shadow[1] = g_eff_sel[st_note2];
-    g_assign_shadow[2] = g_eff_sel[st_note5];
-    g_assign_shadow[3] = g_eff_sel[st_note7];
-    g_assign_shadow[4] = g_eff_sel[st_note6];
-    g_assign_shadow[5] = g_eff_sel[st_note4];
+  (g_eff_sel[st_note_recply] != g_assign_shadow[0] ||
+   g_eff_sel[st_note_plystp] != g_assign_shadow[1] ||
+   g_eff_sel[st_note_clr] != g_assign_shadow[2] ||
+   g_eff_sel[st_note_mon] != g_assign_shadow[3] ||
+   g_eff_sel[st_note_undo] != g_assign_shadow[4] ||
+   g_eff_sel[st_note_rev] != g_assign_shadow[5]) ? (
+    g_assign_shadow[0] = g_eff_sel[st_note_recply];
+    g_assign_shadow[1] = g_eff_sel[st_note_plystp];
+    g_assign_shadow[2] = g_eff_sel[st_note_clr];
+    g_assign_shadow[3] = g_eff_sel[st_note_mon];
+    g_assign_shadow[4] = g_eff_sel[st_note_undo];
+    g_assign_shadow[5] = g_eff_sel[st_note_rev];
     g_assign_dirty = 1;
   );
   g_assign_dirty ? (
@@ -1845,7 +1954,7 @@ function chan_onmsg(m1,m2,m3)
 (
   g_was_firstrec = g_firstrec; // latch to this value for any messages that apply to multiple channels
   (m2 == cfgp_playsel[] || m2 == 1024+cfgp_playsel) && g_chan_selected>=0 ? (
-    m2 = 1024 + mem_stlist + g_chan_selected*st_num + st_note1 +
+    m2 = 1024 + mem_stlist + g_chan_selected*st_num + st_note_recply +
       (mem_stlist[g_chan_selected*st_num + st_state]?1:0);
   );
 
@@ -1941,14 +2050,14 @@ while (sidx == nextmsg_offs)
         // This keeps MIDI routing in sync with whatever is shown in each lane's
         // row — whether the user edited via the globals row or per-lane tweakers.
         // cfgp_common_* remain as UI templates propagated by draw_global_tweaker.
-        nextmsg_2 == g_cmn_rec[st_note1] ? (
+        nextmsg_2 == g_cmn_rec[st_note_recply] ? (
           // REC/PLY: recording→play; stopped/playing→record/overdub.
           g_dbg_cmn_state0 = g_cmn_rec[st_state];
           g_dbg_cmn_dirty0 = g_cmn_rec[st_dirty];
           // Respect latch mode: queue until next loop boundary when g_pos != 0.
           // Queued message fires via chan_onmsg → per-lane onmsg at g_pos==0.
           (!g_latchmode || g_pos == 0 || g_firstrec) ? (
-            common_recply_pair(g_cmn_i);
+            execute_lane_command(CMD_RECPLY, g_cmn_i, SRC_MIDI_COMMON);
             g_dbg_cmn_state1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_state];
             g_dbg_cmn_dirty1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_dirty];
           ) : (
@@ -1958,21 +2067,21 @@ while (sidx == nextmsg_offs)
           g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == g_cmn_rec[st_note5] ? (
+        nextmsg_2 == g_cmn_rec[st_note_clr] ? (
           // Clear lane(s): pair-aware — stops, zeros buffer, drops undo snapshot
           strcpy(g_dbg_cmn_name, "CLR");
           g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
-          clear_pair(g_cmn_i);
+          execute_lane_command(CMD_CLR, g_cmn_i, SRC_MIDI_COMMON);
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == g_cmn_rec[st_note2] ? (
+        nextmsg_2 == g_cmn_rec[st_note_plystp] ? (
           // PLY/STP: recording→play; playing→stop; stopped+content→play; empty→no-op.
           g_dbg_cmn_state0 = g_cmn_rec[st_state];
           g_dbg_cmn_dirty0 = g_cmn_rec[st_dirty];
           // Respect latch mode: queue until next loop boundary when g_pos != 0.
           // Queued message fires via chan_onmsg → per-lane onmsg at g_pos==0.
           (!g_latchmode || g_pos == 0 || g_firstrec) ? (
-            common_plystp_pair(g_cmn_i);
+            execute_lane_command(CMD_PLYSTP, g_cmn_i, SRC_MIDI_COMMON);
             g_dbg_cmn_state1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_state];
             g_dbg_cmn_dirty1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_dirty];
           ) : (
@@ -1982,37 +2091,32 @@ while (sidx == nextmsg_offs)
           g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == g_cmn_rec[st_note4] ? (
+        nextmsg_2 == g_cmn_rec[st_note_rev] ? (
           // REV: pair-aware reverse toggle
           strcpy(g_dbg_cmn_name, "REV");
           g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
-          reverse_pair(g_cmn_i);
+          execute_lane_command(CMD_REV, g_cmn_i, SRC_MIDI_COMMON);
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == g_cmn_rec[st_note6] ? (
+        nextmsg_2 == g_cmn_rec[st_note_undo] ? (
           // Unit 2.1: toggle — REDO if redo stack is available, otherwise UNDO.
           // Both paths are pair-aware and restore both lanes when linked.
-          g_cmn_rec[st_redo_len] > 0 ? (
-            strcpy(g_dbg_cmn_name, "REDO");
-            g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
-            redo_pair(g_cmn_i);
-          ) : (
-            strcpy(g_dbg_cmn_name, "UNDO");
-            g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
-            undo_pair(g_cmn_i);
-          );
+          // execute_lane_command(CMD_UNDO_REDO) toggles redo-first internally.
+          g_cmn_rec[st_redo_len] > 0 ? strcpy(g_dbg_cmn_name, "REDO") : strcpy(g_dbg_cmn_name, "UNDO");
+          g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
+          execute_lane_command(CMD_UNDO_REDO, g_cmn_i, SRC_MIDI_COMMON);
           nextmsg_3 = 0; // suppress further dispatch
         ) :
-        nextmsg_2 == g_cmn_rec[st_note3] ? (
+        nextmsg_2 == g_cmn_rec[st_note_sel] ? (
           strcpy(g_dbg_cmn_name, "SEL");
           g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
-          nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note3;
+          nextmsg_2 = 1024 + pair_owner_rec(g_cmn_i) + st_note_sel;
           common_dispatch = 1; // translated: allow lane dispatch
         ) :
-        nextmsg_2 == g_cmn_rec[st_note7] ? (
+        nextmsg_2 == g_cmn_rec[st_note_mon] ? (
           // MON: disabled↔always-monitor (auto/selected treated as not-always).
           g_dbg_cmn_state0 = g_cmn_rec[st_monmode];
-          common_mon_pair(g_cmn_i);
+          execute_lane_command(CMD_MON, g_cmn_i, SRC_MIDI_COMMON);
           g_dbg_cmn_state1 = (mem_stlist + pair_owner_idx(g_cmn_i)*st_num)[st_monmode];
           strcpy(g_dbg_cmn_name, "MON");
           g_dbg_cmn_ch = g_msg_chan; g_dbg_cmn_idx = g_cmn_i;
@@ -2255,8 +2359,8 @@ function draw_value_tweaker(xpos,ypos,midimem,draw, lbl)
     (mouse_cap & 1) && !(last_mouse_cap&1) ? (
       midimem >= mem_stlist && midimem < mem_stlist+st_num*g_nchan ? (
         t = (midimem-mem_stlist)%st_num;
-        t == st_note1 || t == st_note2 || t == st_note4 || t == st_note5 || t == st_note6 || t == st_note7 ? (
-          t != st_note4 || g_latchmode ? (
+        t == st_note_recply || t == st_note_plystp || t == st_note_rev || t == st_note_clr || t == st_note_undo || t == st_note_mon ? (
+          t != st_note_rev || g_latchmode ? (
             g_inject_midinote = 1024+midimem;
           ) : (
             t = ((midimem-mem_stlist)/st_num)|0;
@@ -2532,9 +2636,90 @@ function set_color(c) (
   gfx_set((c >> 16 & 0xFF) / 255.0, (c >> 8 & 0xFF) / 255.0, (c & 0xFF) / 255.0);
 );
 
+// ── draw_action_strip (Phase 4 UI decomposition) ────────────────────────────
+// Renders the 8-button action row at the bottom of the plugin window.
+// action_y/action_h: vertical bounds of the strip.
+// gap, force_redraw, lasthalve, tw, th, lx, t, w, i: locals from draw().
+// All other dependencies (gfx_*, PR.*, cfgp_*, mem_gen_*) are module globals.
+// Note: 'lasthalve' is read from draw()'s local scope via JSFX's implicit
+// global-like variable sharing within the same @gfx evaluation.
+function draw_action_strip(action_y, action_h, gap, force_redraw)
+  local(i t w lx tw th)
+(
+  // Action button strip at bottom
+  w = ((gfx_w - gap*7) / 8)|0;
+  lx = 0;
+  t = 0;
+  force_redraw ? (
+    // Clear the full area from action strip to window bottom (hides old tweakers)
+    set_color(C_BG_BASE);
+    gfx_rect(0, action_y, gfx_w, gfx_h - action_y);
+    // Strip background
+    PR.Color.Panel = "0C0C14FF";
+    PR.Color.Contour = "181826FF";
+    PR.DisplayPanel(
+      gfx_w * 0.5 / pr_s * 100,
+      (action_y + action_h * 0.5) / pr_s * 100,
+      gfx_w / pr_s * 100,
+      action_h / pr_s * 100
+    );
+  );
+  while ((i = mem_gen_order[t]) >= 0) (
+    force_redraw ? (
+      // Per-button colored panel (PR library replaces draw_button)
+      PR.Color.Panel = "14303CFF";
+      PR.Color.Contour = "216077FF";
+      PR.DisplayPanel(
+        (lx + w * 0.5) / pr_s * 100,
+        (action_y + (action_h - 2) * 0.5) / pr_s * 100,
+        (w - 2) / pr_s * 100,
+        (action_h - 4) / pr_s * 100
+      );
+      // In Flex mode, halve/double are no-ops (adjustsizes() early-exits).
+      // Dim those buttons so the performer knows they are inactive.
+      is_flex_mode() && (i+mem_gen_cfg == cfgp_halve || i+mem_gen_cfg == cfgp_double || i+mem_gen_cfg == cfgp_double_norep)
+        ? gfx_set(1,1,1,0.30) : gfx_set(1);
+      gfx_measurestr(mem_gen_names[i], tw, th);
+      gfx_x = lx + (w - tw) * 0.5;
+      gfx_y = min(action_y + (action_h - th) * 0.5, gfx_h - 28);
+      gfx_drawstr(mem_gen_names[i]);
+      i == 11 ? fadesz_button.draw_topbar_button(lx+4, action_y+4,
+                  sprintf(#, "%s%.0f mS",
+                    w<98 ? "" : w<160 ? "fade " : "halve fade: ", lasthalve));
+    );
+    i += mem_gen_cfg;
+    // MIDI assignment button: centered horizontally, half inside strip / half in empty space below
+    g_show_controls ? draw_value_tweaker(lx + ((w - 45)/2)|0, action_y + action_h - 21, i, force_redraw, 0);
+    !(last_mouse_cap&1) && (mouse_cap&1) && mouse_in(lx, action_y, w, action_h) ? (
+      i == cfgp_reset        ? strcat(#mainthread_todo, "r") :
+      i == cfgp_halve        && !is_flex_mode() ? strcat(#mainthread_todo, "h") :
+      i == cfgp_double       && !is_flex_mode() ? strcat(#mainthread_todo, "d") :
+      i == cfgp_double_norep && !is_flex_mode() ? strcat(#mainthread_todo, "D") :
+      i == cfgp_export       ? strcat(#mainthread_todo, "e") :
+      i == cfgp_xfade        ? strcat(#mainthread_todo, "x") :
+      i == cfgp_playall || i == cfgp_playsel ? g_inject_midinote = 1024 + i;
+    );
+    t += 1;
+    lx += w + gap;
+  );
+);
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── draw() — main per-frame renderer (Phase 4 decomposition notes) ──────────
+// JSFX does not support closures or struct passing, so the lane loop cannot be
+// split into fully independent sub-functions without converting layout locals
+// to globals. Instead the render is organised into labelled conceptual passes:
+//   Pass A — Mouse input / hit-testing (link, lane select, lane PLY/STP click)
+//   Pass B — Lane background and container panel
+//   Pass C — Waveform + per-lane progress fill
+//   Pass D — Controls (value tweakers, monitor icon)
+//   Pass E — Link button icon and linked-pair overlay
+//   Pass 5 — Action button strip at bottom (extracted to draw_action_strip())
+// Fully extracted sub-functions: draw_topbar(), draw_position(), draw_action_strip().
+// ─────────────────────────────────────────────────────────────────────────────
 function draw(ixpos, ypos) local(i gap rec mode force_redraw
   mx my mw t lx ty tw th rec2 wl
-  now dropfile last_show_globals last_show_advanced last_pulse tx
+  now dropfile last_show_controls last_pulse tx
   lane_h avail_lanes action_y action_h
   pr_s state_w peak_w wave_w sub_w mon_w
   state_x peak_x wave_x sub_x mon_x midi_x
@@ -2587,8 +2772,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   force_redraw = gfx_w != last_w || gfx_h != last_h ||
     lasthalve != cfgp_fade[] || lastlen != g_length ||
     lastoffs != g_offs || lastchanlink != cfgp_link[] ||
-    last_show_globals != g_show_advanced ||
-    last_show_advanced != g_show_advanced ||
+    last_show_controls != g_show_controls ||
+    last_show_controls != g_show_controls ||
     last_pulse != (g_sysex_period_rate > 0) ||
     last_flex != g_flex_enabled ||         // Phase 8: redraw on Flex Mode toggle
     last_flex_rec != g_flex_rec_owner_idx; // Phase 8: redraw during live flex recording
@@ -2596,8 +2781,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   lastlen = g_length;
   lastoffs = g_offs;
   lastchanlink = cfgp_link[];
-  last_show_globals = g_show_advanced;
-  last_show_advanced = g_show_advanced;
+  last_show_controls = g_show_controls;
+  last_show_controls = g_show_controls;
   last_pulse = (g_sysex_period_rate > 0);
   last_flex = g_flex_enabled;           // Phase 8
   last_flex_rec = g_flex_rec_owner_idx; // Phase 8
@@ -2624,7 +2809,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   // same x coordinates as their lane siblings.
   action_h = 72;
   action_y = gfx_h - action_h - 21;  // 21px empty space below action strip
-  lane_ypos = ypos + (g_show_advanced ? 56 : 0);
+  lane_ypos = ypos + (g_show_controls ? 56 : 0);
   avail_lanes = action_y - lane_ypos;
   lane_h = max((avail_lanes / g_nchan)|0, 20);
 
@@ -2647,7 +2832,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   mon_x = r_pos - mon_sz;
   r_pos = mon_x - gap;
 
-  g_show_advanced ? (
+  g_show_controls ? (
     // SHOW CONTROLS ON: compute all tweaker positions right-to-left
     gfx_w > 900 ? ( fad_x = r_pos - tweaker_w; r_pos = fad_x - gap; ) : fad_x = -1;
     gfx_w > 820 ? ( div_x = r_pos - tweaker_w; r_pos = div_x - gap; ) : div_x = -1;
@@ -2679,7 +2864,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   wave_w = max(r_pos - wave_x - gap, 30);
 
   // Common mode global strip
-  g_show_advanced ? (
+  g_show_controls ? (
     force_redraw ? (
       // Overall strip background
       PR.Color.Panel = "181030FF";
@@ -2694,20 +2879,20 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
 
     // Draw globals at the same x coordinates as lane siblings.
     // No CH in Globals; it remains lane-local only.
-    rec_x >= 0 ? draw_global_tweaker(rec_x,  ypos+6, cfgp_common_rec,  st_note1, force_redraw, "REC/PLY");
-    ply_x >= 0 ? draw_global_tweaker(ply_x,  ypos+6, cfgp_common_ply,  st_note2, force_redraw, "PLY/STP");
-    rev_x >= 0 ? draw_global_tweaker(rev_x,  ypos+6, cfgp_common_rev,  st_note4, force_redraw, "REV");
-    undo_x >= 0 ? draw_global_tweaker(undo_x, ypos+6, cfgp_common_undo, st_note6, force_redraw, "UNDO/REDO"); // Unit 2.2
-    clr_x >= 0 ? draw_global_tweaker(clr_x,  ypos+6, cfgp_common_clr,  st_note5, force_redraw, "CLR");
+    rec_x >= 0 ? draw_global_tweaker(rec_x,  ypos+6, cfgp_common_rec,  st_note_recply, force_redraw, "REC/PLY");
+    ply_x >= 0 ? draw_global_tweaker(ply_x,  ypos+6, cfgp_common_ply,  st_note_plystp, force_redraw, "PLY/STP");
+    rev_x >= 0 ? draw_global_tweaker(rev_x,  ypos+6, cfgp_common_rev,  st_note_rev, force_redraw, "REV");
+    undo_x >= 0 ? draw_global_tweaker(undo_x, ypos+6, cfgp_common_undo, st_note_undo, force_redraw, "UNDO/REDO"); // Unit 2.2
+    clr_x >= 0 ? draw_global_tweaker(clr_x,  ypos+6, cfgp_common_clr,  st_note_clr, force_redraw, "CLR");
 
-    g_show_advanced ? (
-      sel_x >= 0 ? draw_global_tweaker(sel_x,  ypos+6, cfgp_common_sel,  st_note3, force_redraw, "SEL");
+    g_show_controls ? (
+      sel_x >= 0 ? draw_global_tweaker(sel_x,  ypos+6, cfgp_common_sel,  st_note_sel, force_redraw, "SEL");
       rdc_x >= 0 ? draw_global_lane_tweaker(rdc_x, ypos+6, st_rdc, force_redraw, "RDC");
       div_x >= 0 ? draw_global_lane_tweaker(div_x, ypos+6, st_div, force_redraw, "DIV");
       fad_x >= 0 ? draw_global_lane_tweaker(fad_x, ypos+6, st_fade_size, force_redraw, "FAD");
     );
 
-    mon_btn_x >= 0 ? draw_global_tweaker(mon_btn_x, ypos+6, cfgp_common_mon,  st_note7, force_redraw, "MON");
+    mon_btn_x >= 0 ? draw_global_tweaker(mon_btn_x, ypos+6, cfgp_common_mon,  st_note_mon, force_redraw, "MON");
 
     // Global monitor speaker button: 2-state (0=off, 2=always-on). Styled like per-lane.
     gs_x = mon_x; gs_y = ypos + 6; gs_sz = mon_sz;
@@ -2786,6 +2971,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     row_y  = ypos + i * lane_h;
     row_cy = row_y + (lane_h/2)|0;
 
+    // ── Pass A: Mouse input / hit-testing ──────────────────────────────────
     dropfile && mouse_in(state_x, row_y, gfx_w - 16, lane_h) ? load_file(dropfile, i);
 
     !cap_mode && (mouse_cap&1) && !(last_mouse_cap&1) ? (
@@ -2808,7 +2994,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
         );
       ) : mouse_in(state_x, row_y, state_w, lane_h) ? (
         // Lane identifier click: inject PLY/STP toggle for the pair owner
-        g_inject_midinote = 1024 + pair_owner_rec(i) + st_note2;
+        g_inject_midinote = 1024 + pair_owner_rec(i) + st_note_plystp;
       ) : mouse_in(state_x + state_w, row_y, gfx_w - state_w, lane_h) ? (
         select_pair(i);
       );
@@ -2830,6 +3016,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       // and the selected-lane blue outline redrawn atomically.
       !(i&1) && (cfgp_link[] & (1<<(i>>1))) ? (rec+st_num)[st_lastpkupd] = 0;
 
+      // ── Pass B: Lane background and container panel ────────────────────────
       // Lane container panel (full width minus link area, colored by state)
       // State 2 = recording: vivid red so it's unmistakable vs stopped/playing.
       // State 1 = playing:   visible green.
@@ -2924,6 +3111,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       gfx_drawstr(#_mtxt);
       gfx_setfont(0);
 
+      // ── Pass C: Waveform + progress fill ────────────────────────────────────
       // Waveform sub-panel — inset 2 px top/bottom so the PR contour border
       // remains visible between lanes (matching the ~4 px border on the right side).
       set_color(C_WAVE_TROUGH);
@@ -2981,7 +3169,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
         set_color(C_WAVE_UNPLAYED);
         draw_waveform(wave_x + peak_w + gap, row_cy,
                       wave_w - peak_w - gap * 2, (lane_h-4)*0.45,
-                      rec[st_buf], g_offs % wl, wl, i);
+                      rec[st_buf], get_lane_waveform_start_offset(wl), wl, i);
       );
 
       // Monitor icon: drawn here only for unlinked lanes.
@@ -3023,25 +3211,26 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     // Unlinked lane: draw controls at this lane's vertical centre.
     !is_linked_idx(i) ? (
       ch_x >= 0 ? draw_value_tweaker(ch_x, t_ypos, t + st_midichan, wantr, "CH");
-      rec_x >= 0 ? draw_value_tweaker(rec_x, t_ypos, t + st_note1, wantr,
+      rec_x >= 0 ? draw_value_tweaker(rec_x, t_ypos, t + st_note_recply, wantr,
               rec[st_state]==2 && !g_firstrec ? "PLY" : "REC");
-      ply_x >= 0 ? draw_value_tweaker(ply_x, t_ypos, t + st_note2, wantr,
+      ply_x >= 0 ? draw_value_tweaker(ply_x, t_ypos, t + st_note_plystp, wantr,
               rec[st_state]==1 ? "STP" : "PLY");
-      rev_x >= 0 ? draw_value_tweaker(rev_x, t_ypos, t + st_note4, wantr, "REV");
-      undo_x >= 0 ? draw_value_tweaker(undo_x, t_ypos, t + st_note6, wantr,
+      rev_x >= 0 ? draw_value_tweaker(rev_x, t_ypos, t + st_note_rev, wantr, "REV");
+      undo_x >= 0 ? draw_value_tweaker(undo_x, t_ypos, t + st_note_undo, wantr,
               t[st_redo_len] > 0 ? "REDO" : "UNDO"); // Unit 2.2: multi-state label
-      clr_x >= 0 ? draw_value_tweaker(clr_x, t_ypos, t + st_note5, wantr, "CLR");
+      clr_x >= 0 ? draw_value_tweaker(clr_x, t_ypos, t + st_note_clr, wantr, "CLR");
 
-      g_show_advanced ? (
-        sel_x >= 0 ? draw_value_tweaker(sel_x, t_ypos, t + st_note3, wantr, "SEL");
+      g_show_controls ? (
+        sel_x >= 0 ? draw_value_tweaker(sel_x, t_ypos, t + st_note_sel, wantr, "SEL");
         rdc_x >= 0 ? draw_value_tweaker(rdc_x, t_ypos, t + st_rdc, wantr, "RDC");
         div_x >= 0 ? draw_value_tweaker(div_x, t_ypos, t + st_div, wantr, "DIV");
         fad_x >= 0 ? draw_value_tweaker(fad_x, t_ypos, t + st_fade_size, wantr, "FAD");
       );
 
-      mon_btn_x >= 0 ? draw_value_tweaker(mon_btn_x, t_ypos, t + st_note7, wantr, "MON");
+      mon_btn_x >= 0 ? draw_value_tweaker(mon_btn_x, t_ypos, t + st_note_mon, wantr, "MON");
     );
 
+    // ── Pass D: Controls (tweakers, monitor icon) ───────────────────────────
     // Linked laneA: no controls drawn here — they are drawn during laneB's iteration
     // so laneB panel/waveform draws cannot overwrite them.
 
@@ -3054,23 +3243,23 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       pair_wantr = wantr;
 
       ch_x >= 0 ? draw_value_tweaker(ch_x, t_ypos, t + st_midichan, pair_wantr, "CH");
-      rec_x >= 0 ? draw_value_tweaker(rec_x, t_ypos, t + st_note1, pair_wantr,
+      rec_x >= 0 ? draw_value_tweaker(rec_x, t_ypos, t + st_note_recply, pair_wantr,
               rec2[st_state]==2 && !g_firstrec ? "PLY" : "REC");
-      ply_x >= 0 ? draw_value_tweaker(ply_x, t_ypos, t + st_note2, pair_wantr,
+      ply_x >= 0 ? draw_value_tweaker(ply_x, t_ypos, t + st_note_plystp, pair_wantr,
               rec2[st_state]==1 ? "STP" : "PLY");
-      rev_x >= 0 ? draw_value_tweaker(rev_x, t_ypos, t + st_note4, pair_wantr, "REV");
-      undo_x >= 0 ? draw_value_tweaker(undo_x, t_ypos, t + st_note6, pair_wantr,
+      rev_x >= 0 ? draw_value_tweaker(rev_x, t_ypos, t + st_note_rev, pair_wantr, "REV");
+      undo_x >= 0 ? draw_value_tweaker(undo_x, t_ypos, t + st_note_undo, pair_wantr,
               t[st_redo_len] > 0 ? "REDO" : "UNDO");
-      clr_x >= 0 ? draw_value_tweaker(clr_x, t_ypos, t + st_note5, pair_wantr, "CLR");
+      clr_x >= 0 ? draw_value_tweaker(clr_x, t_ypos, t + st_note_clr, pair_wantr, "CLR");
 
-      g_show_advanced ? (
-        sel_x >= 0 ? draw_value_tweaker(sel_x, t_ypos, t + st_note3, pair_wantr, "SEL");
+      g_show_controls ? (
+        sel_x >= 0 ? draw_value_tweaker(sel_x, t_ypos, t + st_note_sel, pair_wantr, "SEL");
         rdc_x >= 0 ? draw_value_tweaker(rdc_x, t_ypos, t + st_rdc, pair_wantr, "RDC");
         div_x >= 0 ? draw_value_tweaker(div_x, t_ypos, t + st_div, pair_wantr, "DIV");
         fad_x >= 0 ? draw_value_tweaker(fad_x, t_ypos, t + st_fade_size, pair_wantr, "FAD");
       );
 
-      mon_btn_x >= 0 ? draw_value_tweaker(mon_btn_x, t_ypos, t + st_note7, pair_wantr, "MON");
+      mon_btn_x >= 0 ? draw_value_tweaker(mon_btn_x, t_ypos, t + st_note_mon, pair_wantr, "MON");
 
       // Phase 6: draw laneA monitor icon at boundary (moved out of link-button block)
       pair_wantr ? (
@@ -3124,6 +3313,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       );
     );
 
+    // ── Pass E: Link button icon and pair overlay ────────────────────────────
     // Link button: chain-link icon, centered in state_w, straddling pair boundary
     (i&1) && wantr ? (
       link_x = state_x + ((state_w - link_btn_w) * 0.5)|0;
@@ -3164,59 +3354,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     rec += st_num;
   );
 
-  // Action button strip at bottom
-  w = ((gfx_w - gap*7) / 8)|0;
-  lx = 0;
-  t = 0;
-  force_redraw ? (
-    // Clear the full area from action strip to window bottom (hides old tweakers)
-    set_color(C_BG_BASE);
-    gfx_rect(0, action_y, gfx_w, gfx_h - action_y);
-    // Strip background
-    PR.Color.Panel = "0C0C14FF";
-    PR.Color.Contour = "181826FF";
-    PR.DisplayPanel(
-      gfx_w * 0.5 / pr_s * 100,
-      (action_y + action_h * 0.5) / pr_s * 100,
-      gfx_w / pr_s * 100,
-      action_h / pr_s * 100
-    );
-  );
-  while ((i = mem_gen_order[t]) >= 0) (
-    force_redraw ? (
-      // Per-button colored panel (PR library replaces draw_button)
-      PR.Color.Panel = "14303CFF";
-      PR.Color.Contour = "216077FF";
-      PR.DisplayPanel(
-        (lx + w * 0.5) / pr_s * 100,
-        (action_y + (action_h - 2) * 0.5) / pr_s * 100,
-        (w - 2) / pr_s * 100,
-        (action_h - 4) / pr_s * 100
-      );
-      gfx_set(1);
-      gfx_measurestr(mem_gen_names[i], tw, th);
-      gfx_x = lx + (w - tw) * 0.5;
-      gfx_y = min(action_y + (action_h - th) * 0.5, gfx_h - 28);
-      gfx_drawstr(mem_gen_names[i]);
-      i == 11 ? fadesz_button.draw_topbar_button(lx+4, action_y+4,
-                  sprintf(#, "%s%.0f mS",
-                    w<98 ? "" : w<160 ? "fade " : "halve fade: ", lasthalve));
-    );
-    i += mem_gen_cfg;
-    // MIDI assignment button: centered horizontally, half inside strip / half in empty space below
-    g_show_advanced ? draw_value_tweaker(lx + ((w - 45)/2)|0, action_y + action_h - 21, i, force_redraw, 0);
-    !(last_mouse_cap&1) && (mouse_cap&1) && mouse_in(lx, action_y, w, action_h) ? (
-      i == cfgp_reset        ? strcat(#mainthread_todo, "r") :
-      i == cfgp_halve        ? strcat(#mainthread_todo, "h") :
-      i == cfgp_double       ? strcat(#mainthread_todo, "d") :
-      i == cfgp_double_norep ? strcat(#mainthread_todo, "D") :
-      i == cfgp_export       ? strcat(#mainthread_todo, "e") :
-      i == cfgp_xfade        ? strcat(#mainthread_todo, "x") :
-      i == cfgp_playall || i == cfgp_playsel ? g_inject_midinote = 1024 + i;
-    );
-    t += 1;
-    lx += w + gap;
-  );
+  // ── Pass 5: Action button strip ─────────────────────────────────────────
+  draw_action_strip(action_y, action_h, gap, force_redraw);
 );
 
 // ultra_redesign.md Phase 5: in Flex mode the bar now clearly labels itself as the
@@ -3315,7 +3454,7 @@ function draw_pill_value(xp, yp, label, valstr)
   gfx_setfont(0);
 );
 
-function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastclickcount, lastvclickoffs, lastoffs, lastsync, last_show_globals, last_show_advanced, last_pulse, last_flex)
+function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastclickcount, lastvclickoffs, lastoffs, lastsync, last_show_controls, last_pulse, last_flex)
 (
   need_ref == 0 ? (
     need_ref = (lastlen != g_length ||
@@ -3325,7 +3464,7 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
                 lastlatch != g_latchmode ||
                 lastclickcount != (cfgp_clickcnt[]|0) ||
                 lastvclickoffs != cfgp_vclick[] ||
-                last_show_advanced != g_show_advanced ||
+                last_show_controls != g_show_controls ||
                 last_pulse != (g_sysex_period_rate > 0) ||
                 last_flex != g_flex_enabled);  // Phase 8
   );
@@ -3367,7 +3506,7 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
 
     latch_button.draw_pill_toggle(gfx_x + 4, 6, "LATCH", (lastlatch = g_latchmode));
     flex_button.draw_pill_toggle(gfx_x + 4, 6, "FLEX", (last_flex = g_flex_enabled));
-    advanced_button.draw_pill_toggle(gfx_x + 4, 6, "SHOW CONTROLS", (last_show_advanced = g_show_advanced));
+    advanced_button.draw_pill_toggle(gfx_x + 4, 6, "SHOW CONTROLS", (last_show_controls = g_show_controls));
     pulse_button.draw_pill_toggle(gfx_x + 4, 6, "PULSE", (last_pulse = (g_sysex_period_rate > 0)));
   );
 
@@ -3382,10 +3521,10 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
         // toggle
         cfgp_latch[] = g_latchmode = !g_latchmode;
       ) : advanced_button.hit_topbar_button(mouse_x,mouse_y,-1) ? (
-        g_show_advanced = !g_show_advanced;
+        g_show_controls = !g_show_controls;
         // Globals bar is shown/hidden together with CTRL
         // g_show_globals is always 1 -- CTRL no longer controls common-mode dispatch
-        mem_gen_cfg[24] = g_show_advanced;
+        mem_gen_cfg[24] = g_show_controls;
         sliderchange(-1); // persist to @serialize
         last_w = 0;       // force full redraw to show/hide advanced controls + globals
       ) : flex_button.hit_topbar_button(mouse_x,mouse_y,-1) ? (
