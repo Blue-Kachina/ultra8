@@ -2666,15 +2666,14 @@ function draw_action_strip(action_y, action_h, gap, force_redraw)
   );
   while ((i = mem_gen_order[t]) >= 0) (
     force_redraw ? (
-      // Per-button colored panel (PR library replaces draw_button)
-      PR.Color.Panel = "14303CFF";
-      PR.Color.Contour = "216077FF";
-      PR.DisplayPanel(
-        (lx + w * 0.5) / pr_s * 100,
-        (action_y + (action_h - 2) * 0.5) / pr_s * 100,
-        (w - 2) / pr_s * 100,
-        (action_h - 4) / pr_s * 100
-      );
+      // Button panel: dark bg + visible border (same draw style as topbar pills)
+      gfx_set(0.10, 0.10, 0.16);
+      gfx_rect(lx + 1, action_y + 1, w - 2, action_h - 4);
+      set_color(0x303048);
+      gfx_rect(lx + 1,         action_y + 1,              w - 2, 1);
+      gfx_rect(lx + 1,         action_y + action_h - 4,   w - 2, 1);
+      gfx_rect(lx + 1,         action_y + 1,              1,     action_h - 4);
+      gfx_rect(lx + w - 2,     action_y + 1,              1,     action_h - 4);
       // In Flex mode, halve/double are no-ops (adjustsizes() early-exits).
       // Dim those buttons so the performer knows they are inactive.
       is_flex_mode() && (i+mem_gen_cfg == cfgp_halve || i+mem_gen_cfg == cfgp_double || i+mem_gen_cfg == cfgp_double_norep)
