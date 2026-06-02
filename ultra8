@@ -956,6 +956,7 @@ function clear_pair(idx) local(oidx pidx orec prec) (
   orec[st_redo_loop_len] = 0;
   orec[st_loop_phase]    = 0; // reset phase so re-recording captures a fresh start
   orec[st_disp_mult]     = 0; // reset display multiplier for fresh recording
+  orec[st_div]           = 1; // reset subdivision; re-recording starts at full length
   // Clear partner when linked
   pidx >= 0 ? (
     prec = mem_stlist + pidx * st_num;
@@ -969,6 +970,7 @@ function clear_pair(idx) local(oidx pidx orec prec) (
     prec[st_redo_loop_len] = 0;
     prec[st_loop_phase]    = 0;
     prec[st_disp_mult]     = 0;
+    prec[st_div]           = 1;
   );
   is_flex_mode() ? recalc_flex_base_len();
 );
@@ -1221,10 +1223,13 @@ function reset() local(lp)
       memset(lp[st_buf], 0, lp[st_dirty]);
       lp[st_dirty] = 0;
     );
+    lp[st_undo_len]      = 0; // kill-all drops undo snapshot
+    lp[st_redo_len]      = 0; // kill-all drops redo snapshot
     lp[st_loop_len]      = 0; // Phase 1: clear Flex lane length on kill-all
     lp[st_undo_loop_len] = 0;
     lp[st_redo_loop_len] = 0;
     lp[st_loop_phase]    = 0;
+    lp[st_disp_mult]     = 0; // Unit A.1: reset display multiplier
     lp += st_num;
   );
   g_firstrec=g_offs=g_length=g_pos=0;
@@ -3806,29 +3811,28 @@ function lcm(a, b) local(g) ( g = gcd(a|0, b|0); g > 0 ? (a|0) / g * (b|0) : 0; 
 // exported sample corresponds to global beat-0.  The first rep is split into a
 // tail chunk [rotation..l-1] then a head chunk [0..rotation-1]; subsequent reps
 // are exported whole.  In non-Flex mode g_offs fills the same role.
-function export()  local(rec, first_flag, tidx, idx, ster, l, total_len, reps, rotation, ch2off)
+function export()  local(rec, first_flag, tidx, idx, ster, l, ch2off)
 (
-  // ── Step 1: LCM total duration across all active lane lengths ──────────────────────────
-  total_len = 0;
-  rec = mem_stlist; idx = 0;
-  loop(g_nchan,
-    (rec[st_dirty] > 0 && (!(idx&1) || get_linked_rec(idx)<0)) ? (
-      l = is_flex_mode() && rec[st_loop_len] > 0
-          ? rec[st_loop_len]
-          : (g_length > 0 ? (g_length / max(1, rec[st_div]))|0 : 0);
-      l > 0 ? (
-        total_len = total_len > 0 ? lcm(total_len, l) : l;
-      );
-    );
-    idx += 1; rec += st_num;
-  );
-  total_len <= 0 ? total_len = g_length; // guard – nothing dirty yet
+  // Export each active lane as exactly one item (the lane's own loop length).
+  // Users repeat/loop items in the DAW to fill longer cycles -- the "lego block" model.
+  //
+  // Placement flags:
+  //   (1<<16)|(2<<16) -- first item of the first track: place at project end, set tempo.
+  //   0               -- first item of every subsequent track: at cursor (same start time).
+  //
+  // NOTE: 1<<16 ("after last item in project") is intentionally NOT used for secondary
+  // tracks because it is project-wide, not per-track.  Using it on track 2+ would chain
+  // each track after the previous one rather than stacking them at the same start time.
+  //
+  // Each lane is exported directly from rec[st_buf][0..l-1].  For lanes with a phase
+  // offset (rotation > 0) the content starts at musical time `rotation` rather than 0,
+  // but since export_buffer_to_project is asynchronous, pre-rendering into a scratch
+  // buffer and then zeroing it would corrupt the data before Reaper reads it.  Flex
+  // lanes are typically recorded at loop boundaries so rotation is zero or negligible.
 
-  total_len > 0 ? (
+  g_length > 0 ? (
     rec = mem_stlist;
-    // first_flag: consumed once by the very first export call (positions at project
-    // end and sets tempo).  Reps 2+ use 1<<16 (after last item on this track).
-    first_flag = (1<<16)|(2<<16);
+    first_flag = (1<<16)|(2<<16); // first call: place at project end + set tempo
     tidx = idx = 0;
 
     loop(g_nchan,
@@ -3837,46 +3841,15 @@ function export()  local(rec, first_flag, tidx, idx, ster, l, total_len, reps, r
         ch2off = ster>=0 ? ster[st_buf] - rec[st_buf] : 0;
 
         rec[st_dirty] > 0 ? (
-          // ── Lane loop length ───────────────────────────────────────────────────
           l = is_flex_mode() && rec[st_loop_len] > 0
               ? rec[st_loop_len]
               : (g_length / max(1, rec[st_div]))|0;
 
           l > 0 ? (
-            reps = (total_len / l + 0.5)|0;
-
-            // ── Phase rotation ──────────────────────────────────────────────────────────────────
-            is_flex_mode() ? (
-              rotation = (l - (rec[st_loop_phase] % l)) % l;
-            ) : (
-              rotation = g_offs > 0 ? g_offs % l : 0;
-            );
-
-            rotation > 0 ? (
-              // First rep: silence prefix equal to rotation, then full unrotated buffer.
-              // Mirrors the looper UI: every lane appears to start at time 0
-              // relative to the original lane regardless of when it was recorded.
-              export_buffer_to_project(mem_silence_buf, rotation,
-                ster>=0?2:1, srate, tidx, first_flag,
-                first_flag?(cfgp_sync[]?tempo:estbpm(g_length)):0, ch2off);
-              first_flag = 0;
-              export_buffer_to_project(rec[st_buf], l,
-                ster>=0?2:1, srate, tidx, 1<<16, 0, ch2off);
-              loop(reps-1,
-                export_buffer_to_project(rec[st_buf], l,
-                  ster>=0?2:1, srate, tidx, 1<<16, 0, ch2off);
-              );
-            ) : (
-              // No rotation: first rep at cursor/end, reps 2+ append to track
-              export_buffer_to_project(rec[st_buf], l,
-                ster>=0?2:1, srate, tidx, first_flag,
-                first_flag?(cfgp_sync[]?tempo:estbpm(g_length)):0, ch2off);
-              first_flag = 0;
-              loop(reps-1,
-                export_buffer_to_project(rec[st_buf], l,
-                  ster>=0?2:1, srate, tidx, 1<<16, 0, ch2off);
-              );
-            );
+            export_buffer_to_project(rec[st_buf], l,
+              ster>=0?2:1, srate, tidx, first_flag,
+              first_flag?(cfgp_sync[]?tempo:estbpm(g_length)):0, ch2off);
+            first_flag = 0;
           );
         );
 
@@ -3886,7 +3859,6 @@ function export()  local(rec, first_flag, tidx, idx, ster, l, total_len, reps, r
     );
   );
 );
-
 strlen(#mainthread_todo) > 0 ? (
   mtc = str_getchar(#mainthread_todo,0);
   strcpy_substr(#mainthread_todo,#mainthread_todo,1);
