@@ -135,7 +135,9 @@ st_undo_loop_len = 23; // loop length saved alongside the undo audio snapshot
 st_redo_loop_len = 24; // loop length saved alongside the redo audio snapshot
 st_loop_phase    = 25; // g_flex_pos value at which this lane's buffer position 0 begins
 // ─────────────────────────────────────────────────────────────────────────────
-st_num = 26;
+st_disp_mult     = 26; // display amplitude multiplier (computed after recording; 1.0 = no boost)
+st_num = 27;
+MAX_DISPLAY_MULT = 20.0; // waveform display boost cap (20x ~= +26 dB)
 
 // ── Command dispatch constants (Phase 2) ─────────────────────────────────────
 // CMD_* — logical looper actions, independent of how they were triggered.
@@ -220,6 +222,7 @@ function init(x, n1,n2,n3)
   rec[st_undo_loop_len] = 0;
   rec[st_redo_loop_len] = 0;
   rec[st_loop_phase]    = 0;
+  rec[st_disp_mult]     = 0; // no boost until first recording commits
 
   this.updatefromrec();
 );
@@ -444,6 +447,23 @@ function get_lane_waveform_start_offset(wl) (
   is_flex_mode() ? 0 : (wl > 0 ? g_offs % wl : 0);
 );
 
+// Scan srclen samples at bptr and return a display amplitude multiplier.
+// Returns clamp(1 / peak, 1.0, MAX_DISPLAY_MULT) so quiet recordings
+// fill the waveform area visually without altering audio.
+// Called once per lane after recording commits (lazy, from @gfx draw loop).
+function compute_disp_mult(bptr, srclen)
+  local(peak v i)
+(
+  peak = 0;
+  i = 0;
+  loop(srclen,
+    v = bptr[i]; v < 0 ? v = -v;
+    v > peak ? peak = v;
+    i += 1;
+  );
+  peak > 0 ? min(1.0 / peak, MAX_DISPLAY_MULT) : 1.0;
+);
+
 // Returns the committed length multiple relative to the Flex base.
 // Returns 0 for empty lanes or when no base exists.
 function get_lane_length_multiple(idx) local(ll) (
@@ -635,6 +655,7 @@ function setstate(st) instance(fpos_slope, fpos2_slope, rec) local(dt)
       );
     );
   );
+  rec[st_state] == 2 && st != 2 ? rec[st_disp_mult] = 0; // overdub/commit: recompute display multiplier
   rec[st_state] = st;
   rec[st_dirty] = max(max(rec[st_dirty],this.dirty_top+1),st==2);
 
@@ -934,6 +955,7 @@ function clear_pair(idx) local(oidx pidx orec prec) (
   orec[st_undo_loop_len] = 0;
   orec[st_redo_loop_len] = 0;
   orec[st_loop_phase]    = 0; // reset phase so re-recording captures a fresh start
+  orec[st_disp_mult]     = 0; // reset display multiplier for fresh recording
   // Clear partner when linked
   pidx >= 0 ? (
     prec = mem_stlist + pidx * st_num;
@@ -946,6 +968,7 @@ function clear_pair(idx) local(oidx pidx orec prec) (
     prec[st_undo_loop_len] = 0;
     prec[st_redo_loop_len] = 0;
     prec[st_loop_phase]    = 0;
+    prec[st_disp_mult]     = 0;
   );
   is_flex_mode() ? recalc_flex_base_len();
 );
@@ -1079,8 +1102,9 @@ function undo_pair(idx) local(oidx pidx orec prec) (
     orec[st_redo_loop_len] = orec[st_loop_len]; // Phase 7: save current Flex length to redo
     // Restore from undo snapshot.
     memcpy(orec[st_buf], orec[st_undo_buf], orec[st_undo_len]);
-    orec[st_dirty]    = orec[st_undo_len];
-    orec[st_loop_len] = orec[st_undo_loop_len]; // Phase 7: restore Flex lane length
+    orec[st_dirty]     = orec[st_undo_len];
+    orec[st_loop_len]  = orec[st_undo_loop_len]; // Phase 7: restore Flex lane length
+    orec[st_disp_mult] = 0; // buffer changed; recompute display multiplier
     <? loop(x=0;nch, printf("oidx == %d ? ch%d.dirty_top = orec[st_undo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
   );
   pidx >= 0 ? (
@@ -1090,8 +1114,9 @@ function undo_pair(idx) local(oidx pidx orec prec) (
       prec[st_redo_len]      = prec[st_dirty];
       prec[st_redo_loop_len] = prec[st_loop_len];
       memcpy(prec[st_buf], prec[st_undo_buf], prec[st_undo_len]);
-      prec[st_dirty]    = prec[st_undo_len];
-      prec[st_loop_len] = prec[st_undo_loop_len]; // Phase 7
+      prec[st_dirty]     = prec[st_undo_len];
+      prec[st_loop_len]  = prec[st_undo_loop_len]; // Phase 7
+      prec[st_disp_mult] = 0;
       <? loop(x=0;nch, printf("pidx == %d ? ch%d.dirty_top = prec[st_undo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
     );
   );
@@ -1109,8 +1134,9 @@ function redo_pair(idx) local(oidx pidx orec prec) (
   orec = mem_stlist + oidx * st_num;
   orec[st_redo_len] > 0 ? (
     memcpy(orec[st_buf], orec[st_redo_buf], orec[st_redo_len]);
-    orec[st_dirty]    = orec[st_redo_len];
-    orec[st_loop_len] = orec[st_redo_loop_len]; // Phase 7: restore Flex lane length
+    orec[st_dirty]     = orec[st_redo_len];
+    orec[st_loop_len]  = orec[st_redo_loop_len]; // Phase 7: restore Flex lane length
+    orec[st_disp_mult] = 0; // buffer changed; recompute display multiplier
     <? loop(x=0;nch, printf("oidx == %d ? ch%d.dirty_top = orec[st_redo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
     orec[st_redo_len]      = 0; // consume the redo snapshot
     orec[st_redo_loop_len] = 0;
@@ -1119,8 +1145,9 @@ function redo_pair(idx) local(oidx pidx orec prec) (
     prec = mem_stlist + pidx * st_num;
     prec[st_redo_len] > 0 ? (
       memcpy(prec[st_buf], prec[st_redo_buf], prec[st_redo_len]);
-      prec[st_dirty]    = prec[st_redo_len];
-      prec[st_loop_len] = prec[st_redo_loop_len]; // Phase 7
+      prec[st_dirty]     = prec[st_redo_len];
+      prec[st_loop_len]  = prec[st_redo_loop_len]; // Phase 7
+      prec[st_disp_mult] = 0;
       <? loop(x=0;nch, printf("pidx == %d ? ch%d.dirty_top = prec[st_redo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
       prec[st_redo_len]      = 0;
       prec[st_redo_loop_len] = 0;
@@ -1666,6 +1693,12 @@ ext_noinit == 0 ? (
   // Tracks whether the @gfx window was open (gfx_w > 0) in the previous frame.
   // Initialised to 0 so the first frame where gfx_w > 0 is detected as an open.
   g_prev_gfx_open = 0;
+
+  // Pre-zeroed silence block for Add-to-Project offset padding (Unit A.2).
+  // Size covers the maximum possible rotation (g_maxlen) on both channels.
+  // Written once here; never modified -- export() reads it as silence source.
+  mem_silence_buf = alloc(g_maxlen * 2);
+  memset(mem_silence_buf, 0, g_maxlen * 2);
   // ─────────────────────────────────────────────────────────────────────────────
 );
 
@@ -3166,8 +3199,9 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       // communicates position clearly.
       rec[st_dirty] && (wl = get_lane_waveform_display_len(i, rec)) > 0 ? (
         set_color(C_WAVE_UNPLAYED);
+        rec[st_disp_mult] == 0 ? rec[st_disp_mult] = compute_disp_mult(rec[st_buf], wl);
         draw_waveform(wave_x + peak_w + gap, row_cy,
-                      wave_w - peak_w - gap * 2, (lane_h-4)*0.45,
+                      wave_w - peak_w - gap * 2, (lane_h-4)*0.45 * rec[st_disp_mult],
                       rec[st_buf], get_lane_waveform_start_offset(wl), wl, i);
       );
 
@@ -3819,13 +3853,14 @@ function export()  local(rec, first_flag, tidx, idx, ster, l, total_len, reps, r
             );
 
             rotation > 0 ? (
-              // First rep split: tail [rotation … l-1] then head [0 … rotation-1]
-              export_buffer_to_project(rec[st_buf]+rotation, l-rotation,
+              // First rep: silence prefix equal to rotation, then full unrotated buffer.
+              // Mirrors the looper UI: every lane appears to start at time 0
+              // relative to the original lane regardless of when it was recorded.
+              export_buffer_to_project(mem_silence_buf, rotation,
                 ster>=0?2:1, srate, tidx, first_flag,
                 first_flag?(cfgp_sync[]?tempo:estbpm(g_length)):0, ch2off);
               first_flag = 0;
-              // head of first rep + all subsequent reps append to this track
-              export_buffer_to_project(rec[st_buf], rotation,
+              export_buffer_to_project(rec[st_buf], l,
                 ster>=0?2:1, srate, tidx, 1<<16, 0, ch2off);
               loop(reps-1,
                 export_buffer_to_project(rec[st_buf], l,
