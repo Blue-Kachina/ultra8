@@ -3043,7 +3043,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     mode |= rec[st_monmode] << 8;
     g_firstrec ? mode |= 1<<30;
 
-    force_redraw || rec[st_lastd] != mode || now > rec[st_lastpkupd] + 0.05 || rec[st_state] > 0 ? (
+    force_redraw || rec[st_lastd] != mode || now > rec[st_lastpkupd] + 0.05 || rec[st_state] > 0 || rec[st_monmode] > 0 ? (
       rec[st_lastd] = mode;
       rec[st_lastpkupd] = now;
       wantr = 1;
