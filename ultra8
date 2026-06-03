@@ -2785,7 +2785,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   C_CONT_SEL       = 0x7080E0;   // selected contour
   C_WAVE_TROUGH    = 0x0E0E1E;   // waveform sub-panel bg
   C_WAVE_PLAYED    = 0xCCCCCC;   // played: near-white
-  C_WAVE_UNPLAYED  = 0x404060;   // unplayed: dim blue-grey
+  C_WAVE_UNPLAYED  = 0x787C98;   // unplayed: mid cool-grey
   C_PROG_PLAY      = 0x1F341C;   // playing progress fill (playback highlight)
   C_PROG_REC       = 0x44191B;   // recording progress fill (recording highlight)
   C_PROG_STOP      = 0x1D242C;   // stopped progress fill (main UI highlight)
@@ -3420,9 +3420,7 @@ function draw_position(ypos) local(last_pos, last_len, bar_h, lbl_w, lh, bar_x, 
     );
     bar_x = lbl_w + 16;
 
-    // Progress fill (right of label)
-    set_color(0x1040A0);
-    last_len > 0 ? gfx_rect(bar_x, ypos, (last_pos / last_len) * (gfx_w - bar_x), bar_h);
+    // Progress fill hidden -- bar_x trough bg already covers this area
 
     // Label text
     is_flex_mode() ? set_color(0x8DC88D) : set_color(0xCCCCDD);
