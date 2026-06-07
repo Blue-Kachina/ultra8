@@ -1377,6 +1377,50 @@ function emit_sysex_snapshot()
 );
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── Timing Metadata Builder/Emitter (Unit A.2) ───────────────
+//
+// build_timing_snapshot()
+//   Fills g_timing_buf[0..23] with a 24-byte msg_type 0x03 timing packet.
+//   For each lane i, encodes rec[st_loop_len] / srate * 1000 as 14-bit
+//   period_ms (clamped 0-16383). 0 = loop not yet established.
+//   Packet layout: docs/protocol_timing_v0_1.md
+//
+// emit_timing_snapshot()
+//   Increments g_timing_seq, builds, sends via midisend_buf().
+//
+function build_timing_snapshot()
+  local(i, rec, period_ms)
+(
+  g_timing_buf[0]  = 0xF0;   // SysEx start
+  g_timing_buf[1]  = 0x7D;   // Non-commercial manufacturer ID
+  g_timing_buf[2]  = 0x55;   // Ultra8 NANO4 protocol identifier
+  g_timing_buf[3]  = 0x03;   // msg_type: timing metadata
+  g_timing_buf[4]  = g_timing_seq & 0x7F;         // seq_lo
+  g_timing_buf[5]  = (g_timing_seq >> 7) & 0x7F;  // seq_hi
+  g_timing_buf[6]  = 8;      // num_lanes
+
+  i = 0;
+  loop(8,
+    rec = i * st_num + mem_stlist;
+    period_ms = (rec[st_loop_len] > 0 && srate > 0)
+      ? min(16383, (rec[st_loop_len] / srate * 1000) | 0)
+      : 0;
+    g_timing_buf[7 + i*2]     = period_ms & 0x7F;          // period_lo
+    g_timing_buf[7 + i*2 + 1] = (period_ms >> 7) & 0x7F;   // period_hi
+    i += 1;
+  );
+
+  g_timing_buf[23] = 0xF7;  // SysEx end
+);
+
+function emit_timing_snapshot()
+(
+  g_timing_seq = (g_timing_seq + 1) & 0x3FFF;
+  build_timing_snapshot();
+  midisend_buf(0, g_timing_buf, 24);
+);
+
+
 // ── SysEx Assignment Message Builder/Emitter (Unit 6.3) ─────────────────────
 //
 // decode_assignment(raw, out_buf, offset)
@@ -1692,6 +1736,12 @@ ext_noinit == 0 ? (
   g_assign_shadow[4] = -1;   // undo
   g_assign_shadow[5] = -1;   // rev
   g_assign_dirty = 0;
+
+  // ── Timing Metadata Emitter init (Unit A.2) ────────────
+  // g_timing_seq: 14-bit counter; 0 on boot, incremented before each emit
+  // g_timing_buf: 24-float alloc block; one slot per MIDI byte
+  g_timing_seq = 0;
+  g_timing_buf = alloc(24);
   // ─────────────────────────────────────────────────────────────────────────────
 
   // ── UI open detection — init (IG-1) ─────────────────────────────────────────
@@ -1923,6 +1973,7 @@ g_dbg_fb_enabled ? (
 // firing immediately after a state-change one.
 g_sysex_enabled && g_sysex_dirty ? (
   emit_sysex_snapshot();
+  emit_timing_snapshot();   // Unit A.2: timing metadata
   g_sysex_dirty = 0;
   g_sysex_period_rate > 0 ? (
     g_sysex_period_counter = (srate / g_sysex_period_rate) | 0;
@@ -1973,6 +2024,7 @@ g_sysex_enabled && g_sysex_period_rate > 0 ? (
   (g_sysex_period_counter -= samplesblock) <= 0 ? (
     emit_sysex_snapshot();
     emit_assign_snapshot();  // heartbeat: piggyback for reconnect recovery
+    emit_timing_snapshot();   // heartbeat: piggyback timing metadata
     g_sysex_period_counter = (srate / g_sysex_period_rate) | 0;
   );
 );
