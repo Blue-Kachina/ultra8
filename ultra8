@@ -99,7 +99,14 @@ slider4:g_slider_click_cnt=0<0,64,1>-Click count/length
 g_nchan = <? printf("%d",nch) ?>;
 g_max_alloc = __memtop(); // JSFX memory available
 g_latchq_len = 1024; // 1024 midi events queueable for latch mode
-g_maxlen = ((g_max_alloc - 4096 - g_latchq_len*3)/(g_nchan*3))|0; // one-third each: active buffer, undo snapshot, redo snapshot
+// Pitch detection buffer size: smallest power of 2 >= AMDF_W + tau_max + headroom.
+// Must be set before g_maxlen so the audio buffer formula accounts for it.
+g_pitch_amdf_W = 64;   // AMDF window (reduced from 512 for performance)
+g_pitch_buf_size = 2048;
+g_pitch_buf_size < (g_pitch_amdf_W + (srate/25|0) + 64) ? g_pitch_buf_size = 4096;
+g_pitch_buf_size < (g_pitch_amdf_W + (srate/25|0) + 64) ? g_pitch_buf_size = 8192;
+g_pitch_buf_size < (g_pitch_amdf_W + (srate/25|0) + 64) ? g_pitch_buf_size = 16384;
+g_maxlen = ((g_max_alloc - 4096 - g_latchq_len*3 - g_nchan*g_pitch_buf_size - 300)/(g_nchan*3))|0; // one-third each: active buffer, undo snapshot, redo snapshot
 g_infthreshdb = -120;
 g_infthresh = 10^(g_infthreshdb/20);
 g_latchmode=0;
@@ -825,6 +832,15 @@ function process(s)
   );
   peak_in = max(abs(s),peak_in);
 
+  // Tuner taps (Phase 3 + 4): only for tuner-enabled lanes.
+  (mem_tuner + idx * tuner_num)[0] ? (
+    // Phase 3: peak accumulator for signal-level display
+    mem_tuner_peak[idx] = max(mem_tuner_peak[idx], abs(s));
+    // Phase 4: write to circular pitch-detection buffer
+    mem_pitch_buf[idx * g_pitch_buf_size + (mem_pitch_pos[idx] | 0)] = s;
+    mem_pitch_pos[idx] = ((mem_pitch_pos[idx] | 0) + 1) & (g_pitch_buf_size - 1);
+  );
+
   // Phase 2: use per-lane helpers so Flex Mode can supply per-lane length/position.
   // In non-Flex Mode (g_flex_enabled==0) both helpers return g_length / g_pos unchanged.
   // During the initial first-recording pass (g_firstrec > 0) the lane has no committed
@@ -1520,6 +1536,221 @@ function emit_assign_snapshot()
   );
 );
 // ─────────────────────────────────────────────────────────────────────────────
+// detect_pitch(lane_idx)  — Phase 4 AMDF pitch detection
+//
+// Average Magnitude Difference Function:
+//   AMDF(τ) = (1/W) Σ |x[n] − x[n+τ]|   for n = 0..W−1
+// The lag τ* with the lowest AMDF is the estimated fundamental period.
+//
+// Search range: ~25 Hz (below bass low B0) to ~1200 Hz (above guitar top string).
+// W = 512 samples; buffer = 8192 samples (≈185 ms @ 44100 Hz).
+// Results written to mem_pitch_result; consumed by build_emit_tuner_sysex().
+// Must be defined BEFORE build_emit_tuner_sysex (EEL2 single-pass compiler).
+// ─────────────────────────────────────────────────────────────────────────────
+
+function detect_pitch(lane_idx)
+  local(
+    result_base buf_base write_pos read_start
+    tau_min tau_max tau tau_step W
+    best_tau best_amdf worst_amdf amdf_sum
+    i pos_n pos_ntau
+    f midi_exact note_round note_name octave_byte
+    cents_f cents_mag cents_sign
+    prev_note stab_count stab confidence rms_est
+  )
+  global(
+    srate
+    g_pitch_buf_size g_pitch_amdf_W mem_pitch_buf mem_pitch_pos
+    pitch_result_num mem_pitch_result
+    mem_pitch_prev_note mem_pitch_stab_count
+    mem_tuner_peak
+  )
+(
+  result_base = mem_pitch_result + lane_idx * pitch_result_num;
+  buf_base    = mem_pitch_buf    + lane_idx * g_pitch_buf_size;
+  write_pos   = mem_pitch_pos[lane_idx] | 0;
+
+  tau_min  = (srate / 1200) | 0;  // ~36 samples @ 44100 Hz  →  upper limit ~1200 Hz
+  tau_max  = (srate / 25)   | 0;  // ~1764 samples @ 44100 Hz →  lower limit ~25 Hz
+  W        = g_pitch_amdf_W;       // AMDF analysis window (samples)
+  tau_step = 2;                    // evaluate every 2nd tau for 2× speedup
+
+  // Signal check using still-live peak accumulator.
+  // Below ~0.3% FS: no signal — clear results, skip detection.
+  rms_est = mem_tuner_peak[lane_idx];
+  rms_est < 0.003 ? (
+    result_base[4] = 0;   // confidence
+    result_base[5] = 0;   // stable
+    mem_pitch_stab_count[lane_idx] = 0;
+  ) : (
+
+    // read_start: oldest sample giving W + tau_max history behind write_pos.
+    // read_start: oldest sample giving W + tau_max history behind write_pos.
+    read_start = write_pos - W - tau_max;
+    read_start < 0 ? read_start += g_pitch_buf_size;
+
+    // ── AMDF search ──────────────────────────────────────────────────────────────────────
+    best_tau   = tau_min;
+    best_amdf  = 1000000;  // sentinel: larger than any real AMDF value
+    worst_amdf = 0;
+
+    tau = tau_min;
+    loop((tau_max - tau_min) / tau_step + 1,
+      amdf_sum = 0;
+      i = 0;
+      loop(W,
+        pos_n    = (read_start + i)       & (g_pitch_buf_size - 1);
+        pos_ntau = (read_start + i + tau) & (g_pitch_buf_size - 1);
+        amdf_sum += abs(buf_base[pos_n] - buf_base[pos_ntau]);
+        i += 1;
+      );
+      amdf_sum < best_amdf ? (
+        best_amdf = amdf_sum;
+        best_tau  = tau;
+      );
+      amdf_sum > worst_amdf ? worst_amdf = amdf_sum;
+      tau += tau_step;
+    );
+
+    // ── Confidence ─────────────────────────────────────────────────────────────────
+    // Self-normalised: depth of AMDF minimum vs worst lag in search range.
+    // Pure tone → best≈0, worst is large → confidence→127.
+    // Noise     → best≈worst          → confidence→0.
+    // No rms_est dependency — robust to transient peaks.
+    worst_amdf > 0 ? (
+      confidence = (127 * (1 - best_amdf / worst_amdf)) | 0;
+      confidence < 0   ? confidence = 0;
+      confidence > 127 ? confidence = 127;
+    ) : (
+      confidence = 0;
+    );
+
+    // ── Period → frequency → MIDI note ───────────────────────────────────────────
+    f          = srate / best_tau;
+    // MIDI note: n = 69 + 12 * log2(f/440)  (log2 via natural log * 1.44269504)
+    midi_exact = 69 + 12 * log(f / 440) * 1.44269504;
+    note_round = (midi_exact + 0.5) | 0;   // round to nearest semitone
+    note_round < 0   ? note_round = 0;
+    note_round > 127 ? note_round = 127;
+    note_name   = note_round % 12;
+    // Encode octave: MIDI octave = note/12 - 1; protocol offset +2
+    octave_byte = ((note_round / 12 | 0) - 1) + 2;
+    octave_byte < 0 ? octave_byte = 0;
+    octave_byte > 7 ? octave_byte = 7;
+
+    // ── Cents offset ────────────────────────────────────────────────────────────────
+    cents_f = (midi_exact - note_round) * 100;   // -50 .. +50
+    cents_f >= 0 ? (
+      cents_sign = 1;                              // sharp
+      cents_mag  = (cents_f + 0.5) | 0;
+    ) : (
+      cents_sign = 0;                              // flat / exact
+      cents_mag  = (-cents_f + 0.5) | 0;
+    );
+    cents_mag > 50 ? cents_mag = 50;
+
+    // ── Stable flag ────────────────────────────────────────────────────────────────
+    // Stable = same semitone for 5 consecutive 10 Hz detections (~500 ms).
+    prev_note  = mem_pitch_prev_note[lane_idx]   | 0;
+    stab_count = mem_pitch_stab_count[lane_idx]  | 0;
+    note_round == prev_note ? (
+      stab_count += 1;
+    ) : (
+      stab_count = 0;
+      mem_pitch_prev_note[lane_idx] = note_round;
+    );
+    mem_pitch_stab_count[lane_idx] = stab_count;
+    stab = stab_count >= 5 ? 1 : 0;
+
+    // ── Write results ───────────────────────────────────────────────────────────────
+    result_base[0] = note_name;
+    result_base[1] = octave_byte;
+    result_base[2] = cents_sign;
+    result_base[3] = cents_mag;
+    result_base[4] = confidence;
+    result_base[5] = stab;
+  );
+);
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Tuner command handlers ────────────────────────────────────────────────────
+//
+// handle_tuner_on(lane_idx):
+//   Enables tuner mode for lane_idx.  Blocked during recording/overdubbing
+//   (st_state == 2).  Saves the lane's current monmode, mutes live monitoring,
+//   marks the lane tuner-enabled, and schedules a state snapshot.
+//
+// handle_tuner_off(lane_idx):
+//   Disables tuner mode.  Emits a final active=0 tuner SysEx so the NANO4
+//   exits TUNER_ACTIVE cleanly, restores saved monmode, then clears the flag.
+//
+// build_emit_tuner_sysex(lane_idx, active):
+//   Builds and sends a 16-byte msg_type=0x04 tuner SysEx packet.
+//   Phase 1: emits fake pitch data (E1, -7c flat, confidence 104) for all
+//   enabled lanes.  Phase 4 will replace this with real pitch detection output.
+//
+//   Packet layout (tuner_implementation.md §SysEx):
+//     F0 7D 55 04 seq_lo seq_hi lane active note octave cents_mag cents_sign
+//     confidence signal_level stable F7                        (16 bytes total)
+
+function build_emit_tuner_sysex(lane_idx, active) (
+  g_tuner_seq = (g_tuner_seq + 1) & 0x3FFF;
+  g_tuner_buf[0]  = 0xF0;
+  g_tuner_buf[1]  = 0x7D;
+  g_tuner_buf[2]  = 0x55;
+  g_tuner_buf[3]  = 0x04;                        // msg_type: tuner update
+  g_tuner_buf[4]  = g_tuner_seq & 0x7F;          // seq_lo
+  g_tuner_buf[5]  = (g_tuner_seq >> 7) & 0x7F;  // seq_hi
+  g_tuner_buf[6]  = lane_idx + 1;                // lane (1-indexed, 1-8)
+  g_tuner_buf[7]  = active;                       // 1 = tuner active, 0 = exit
+  // Phase 4: real pitch data from detect_pitch() called just before this.
+  g_tuner_build_r = mem_pitch_result + lane_idx * pitch_result_num;
+  g_tuner_buf[8]  = g_tuner_build_r[0];           // note (0-11)
+  g_tuner_buf[9]  = g_tuner_build_r[1];           // octave_byte (actual+2)
+  g_tuner_buf[10] = g_tuner_build_r[3];           // cents_mag (0-50)
+  g_tuner_buf[11] = g_tuner_build_r[2];           // cents_sign (0=flat 1=sharp)
+  g_tuner_buf[12] = g_tuner_build_r[4];           // confidence (0-127)
+  // Map peak accumulator to 0-127 (linear; 0.5 FS = 127).  Reset after read.
+  g_tuner_buf[13] = min(127, (mem_tuner_peak[lane_idx] * 256) | 0);
+  mem_tuner_peak[lane_idx] = 0;
+  g_tuner_buf[14] = g_tuner_build_r[5];           // stable (0/1)
+  g_tuner_buf[15] = 0xF7;
+  midisend_buf(0, g_tuner_buf, 16);
+);
+// ─────────────────────────────────────────────────────────────────────────────
+
+function handle_tuner_on(lane_idx) local(rec trec pidx) (
+  rec  = mem_stlist + lane_idx * st_num;
+  trec = mem_tuner  + lane_idx * tuner_num;
+  // Block entry during recording or overdubbing (st_state == 2 covers both)
+  rec[st_state] != 2 && trec[0] == 0 ? (
+    trec[1] = rec[st_monmode];    // save previous monitor mode (owner)
+    rec[st_monmode] = 0;          // mute live monitoring (tuner-mode suppression)
+    // Sync linked partner lane if present
+    pidx = pair_partner_idx(lane_idx);
+    pidx >= 0 ? (mem_stlist + pidx * st_num)[st_monmode] = 0;
+    updatechfromrec();            // sync instance variables (same pattern as common_mon_pair)
+    trec[0] = 1;                  // mark tuner enabled
+    g_sysex_dirty = 1;            // schedule state snapshot so NANO4 sees change
+  );
+);
+
+function handle_tuner_off(lane_idx) local(rec trec pidx) (
+  trec = mem_tuner + lane_idx * tuner_num;
+  trec[0] == 1 ? (
+    build_emit_tuner_sysex(lane_idx, 0); // send active=0 so NANO4 exits TUNER_ACTIVE cleanly
+    rec = mem_stlist + lane_idx * st_num;
+    rec[st_monmode] = trec[1];    // restore previous monitor mode (owner)
+    // Sync linked partner lane — saved value applies to both (pair always shares monmode)
+    pidx = pair_partner_idx(lane_idx);
+    pidx >= 0 ? (mem_stlist + pidx * st_num)[st_monmode] = trec[1];
+    updatechfromrec();            // sync instance variables
+    trec[0] = 0;                  // clear tuner enabled
+    g_sysex_dirty = 1;            // schedule state snapshot
+  );
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 // one-time initialization
 ext_noinit == 0 ? (
@@ -1742,6 +1973,57 @@ ext_noinit == 0 ? (
   // g_timing_buf: 24-float alloc block; one slot per MIDI byte
   g_timing_seq = 0;
   g_timing_buf = alloc(24);
+  // ── Tuner state — init ─────────────────────────────────────────────────────
+  // Dedicated memory block for per-lane tuner state.
+  // Not appended to mem_stlist (which is near capacity at 27 slots/lane).
+  // Fields per lane (tuner_num = 2):
+  //   offset 0 — tuner_enabled:    1 if tuner mode is active for this lane
+  //   offset 1 — tuner_prev_mon:   saved st_monmode, restored on tuner exit
+  tuner_num = 2;
+  mem_tuner = alloc(g_nchan * tuner_num);
+  memset(mem_tuner, 0, g_nchan * tuner_num);
+  //
+  // g_tuner_cc:             raw CC number (26) for TUNER_ON/OFF commands
+  // g_tuner_seq:            14-bit rolling sequence counter for tuner SysEx
+  // g_tuner_buf:            16-float alloc block (one slot per MIDI byte)
+  // g_tuner_period_counter: countdown in samples; fires at ~10 Hz
+  g_tuner_cc             = 26;
+  g_tuner_seq            = 0;
+  g_tuner_buf            = alloc(16);
+  g_tuner_period_counter = (srate / 10) | 0;   // first fire ~100 ms after boot
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── Tuner signal level accumulator — init (Phase 3) ──────────────────────────
+  // Per-lane peak accumulator: tapped inside process() once per audio sample.
+  // Read and reset each time build_emit_tuner_sysex() fires (~10 Hz).
+  // Separate from mem_tuner to avoid changing tuner_num.
+  mem_tuner_peak = alloc(g_nchan);
+  memset(mem_tuner_peak, 0, g_nchan);
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── Pitch detection buffers — init (Phase 4) ──────────────────────────────────────────────
+  // Per-lane circular sample buffers for AMDF pitch detection.
+  // g_pitch_buf_size must be a power of two (bitmask used in inner loop).
+  // g_pitch_buf_size is set early in @init (before g_maxlen) so the audio
+  // buffer formula correctly reserves space for it. Do not override it here.
+  mem_pitch_buf    = alloc(g_nchan * g_pitch_buf_size);
+  memset(mem_pitch_buf, 0, g_nchan * g_pitch_buf_size);
+  mem_pitch_pos    = alloc(g_nchan);         // circular write pointer per lane
+  memset(mem_pitch_pos, 0, g_nchan);
+  // Per-lane pitch result block (read by build_emit_tuner_sysex at 10 Hz):
+  //   [0] note        0-11   (C=0 … B=11)
+  //   [1] octave_byte        (actual_octave + 2, per protocol)
+  //   [2] cents_sign  0=flat / 1=sharp
+  //   [3] cents_mag   0-50
+  //   [4] confidence  0-127
+  //   [5] stable      0/1
+  pitch_result_num     = 6;
+  mem_pitch_result     = alloc(g_nchan * pitch_result_num);
+  memset(mem_pitch_result, 0, g_nchan * pitch_result_num);
+  mem_pitch_prev_note  = alloc(g_nchan);     // last detected semitone
+  memset(mem_pitch_prev_note, 0, g_nchan);
+  mem_pitch_stab_count = alloc(g_nchan);     // consecutive same-note counter
+  memset(mem_pitch_stab_count, 0, g_nchan);
   // ─────────────────────────────────────────────────────────────────────────────
 
   // ── UI open detection — init (IG-1) ─────────────────────────────────────────
@@ -2035,6 +2317,25 @@ g_sysex_enabled && g_sysex_period_rate > 0 ? (
   );
 );
 // ─────────────────────────────────────────────────────────────────────────────
+// ── Tuner SysEx emission — ~10 Hz ─────────────────────────────────────────────
+// Fires build_emit_tuner_sysex() for each tuner-enabled lane at ~10 Hz.
+// Phase 1: emits fake pitch data; Phase 4 replaces with real detection output.
+g_sysex_enabled ? (
+  (g_tuner_period_counter -= samplesblock) <= 0 ? (
+    g_tuner_emit_i = 0;
+    loop(g_nchan,
+      (mem_tuner + g_tuner_emit_i * tuner_num)[0] ? (
+        // Phase 4: run AMDF pitch detection before building SysEx packet
+        detect_pitch(g_tuner_emit_i);
+        build_emit_tuner_sysex(g_tuner_emit_i, 1);
+      );
+      g_tuner_emit_i += 1;
+    );
+    g_tuner_period_counter = (srate / 10) | 0;
+  );
+);
+// ─────────────────────────────────────────────────────────────────────────────
+
 
 (g_click_int = (cfgp_clickcnt[]|0)) > 0 ?(
   g_click_lenspls = (0.01*srate)|0;
@@ -2116,6 +2417,25 @@ while (sidx == nextmsg_offs)
 (
   // Extract MIDI channel BEFORE CC/PC remap (which overwrites the status byte)
   g_msg_chan = (nextmsg_1 & 0x0F) + 1;
+  // ── Tuner CC26 intercept (before CC-to-note remap) ──────────────────────────
+  // CC26 value=127 -> TUNER_ON; CC26 value=0 -> TUNER_OFF.
+  // Intercepted here so value=0 (OFF) is caught before the remap gate at the
+  // next line (which discards CC value=0 via "nextmsg_3 >= 1").
+  // After handling, nextmsg_3 is zeroed to suppress further common-mode dispatch.
+  (nextmsg_1 & 0xF0) == 0xB0 && nextmsg_2 == g_tuner_cc ? (
+    g_tuner_cmd_lane = -1;
+    g_tuner_i = 0;
+    loop(g_nchan,
+      (mem_stlist + g_tuner_i * st_num)[st_midichan] == g_msg_chan ? g_tuner_cmd_lane = g_tuner_i;
+      g_tuner_i += 1;
+    );
+    g_tuner_cmd_lane >= 0 ? (
+      nextmsg_3 == 0   ? handle_tuner_off(g_tuner_cmd_lane) :
+      nextmsg_3 == 127 ? handle_tuner_on(g_tuner_cmd_lane);
+    );
+    nextmsg_3 = 0; // suppress CC-to-note remap and common-mode dispatch
+  );
+  // ──────────────────────────────────────────────────────────────────────────────
 
   // Remap CC/PC to note-on, preserving channel nibble.
   // Gate CC on value >= 1: discard value=0 release messages from button controllers.
@@ -3416,8 +3736,15 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       ((mouse_cap&1) && !(last_mouse_cap&1) || (mouse_cap&2) && !(last_mouse_cap&2)) && !cap_mode &&
           mouse_in(mon_x, mon_hit_y, mon_sz, mon_hit_h) ? (
         mon_hit_rec[st_monmode] = (mon_hit_rec[st_monmode] + 1) % 3;
-        rec2 = get_linked_rec(i);
-        rec2 >= 0 ? rec2[st_monmode] = mon_hit_rec[st_monmode];
+        // For a linked pair the icon belongs to laneB (odd i).
+        // mon_hit_rec already points to the owner (laneA); sync the partner (laneB = rec).
+        // For unlinked lanes mon_hit_rec == rec so get_linked_rec returns -1 (no-op).
+        is_linked_idx(i) ? (
+          rec[st_monmode] = mon_hit_rec[st_monmode];
+        ) : (
+          rec2 = get_linked_rec(i);
+          rec2 >= 0 ? rec2[st_monmode] = mon_hit_rec[st_monmode];
+        );
         updatechfromrec();
         sliderchange(-1);
       );
