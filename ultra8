@@ -1719,22 +1719,7 @@ function build_emit_tuner_sysex(lane_idx, active) (
 );
 // ─────────────────────────────────────────────────────────────────────────────
 
-function handle_tuner_on(lane_idx) local(rec trec pidx) (
-  rec  = mem_stlist + lane_idx * st_num;
-  trec = mem_tuner  + lane_idx * tuner_num;
-  // Block entry during recording or overdubbing (st_state == 2 covers both)
-  rec[st_state] != 2 && trec[0] == 0 ? (
-    trec[1] = rec[st_monmode];    // save previous monitor mode (owner)
-    rec[st_monmode] = 0;          // mute live monitoring (tuner-mode suppression)
-    // Sync linked partner lane if present
-    pidx = pair_partner_idx(lane_idx);
-    pidx >= 0 ? (mem_stlist + pidx * st_num)[st_monmode] = 0;
-    updatechfromrec();            // sync instance variables (same pattern as common_mon_pair)
-    trec[0] = 1;                  // mark tuner enabled
-    g_sysex_dirty = 1;            // schedule state snapshot so NANO4 sees change
-  );
-);
-
+// handle_tuner_off defined before handle_tuner_on (EEL2 requires callee before caller).
 function handle_tuner_off(lane_idx) local(rec trec pidx) (
   trec = mem_tuner + lane_idx * tuner_num;
   trec[0] == 1 ? (
@@ -1747,6 +1732,31 @@ function handle_tuner_off(lane_idx) local(rec trec pidx) (
     updatechfromrec();            // sync instance variables
     trec[0] = 0;                  // clear tuner enabled
     g_sysex_dirty = 1;            // schedule state snapshot
+  );
+);
+
+function handle_tuner_on(lane_idx) local(rec trec pidx steal_i steal_trec) (
+  rec  = mem_stlist + lane_idx * st_num;
+  trec = mem_tuner  + lane_idx * tuner_num;
+  // Block entry during recording or overdubbing (st_state == 2 covers both)
+  rec[st_state] != 2 && trec[0] == 0 ? (
+    // Phase 5: one-active-tuner policy — steal focus from any other active tuner lane.
+    steal_i = 0;
+    loop(g_nchan,
+      steal_i != lane_idx ? (
+        steal_trec = mem_tuner + steal_i * tuner_num;
+        steal_trec[0] ? handle_tuner_off(steal_i);
+      );
+      steal_i += 1;
+    );
+    trec[1] = rec[st_monmode];    // save previous monitor mode (owner)
+    rec[st_monmode] = 0;          // mute live monitoring (tuner-mode suppression)
+    // Sync linked partner lane if present
+    pidx = pair_partner_idx(lane_idx);
+    pidx >= 0 ? (mem_stlist + pidx * st_num)[st_monmode] = 0;
+    updatechfromrec();            // sync instance variables (same pattern as common_mon_pair)
+    trec[0] = 1;                  // mark tuner enabled
+    g_sysex_dirty = 1;            // schedule state snapshot so NANO4 sees change
   );
 );
 
