@@ -206,7 +206,7 @@ function init(x, n1,n2,n3)
   rec[st_state]=0;
   rec[st_lastd]=-1;
   rec[st_dirty]=0;
-  rec[st_monmode] = 1;
+  rec[st_monmode] = 0; // fix_disjointed_monitoring Phase 1: default off
   rec[st_buf] = buf;
   rec[st_peak_in] = 0;
   rec[st_rdc] = 0;
@@ -1845,6 +1845,12 @@ function doconf() local(i,s) (
     );
   );
 
+  // fix_disjointed_monitoring Phase 3: persist g_global_monmode so the global speaker
+  // button shows the correct on/off state after project reload.
+  file_avail(0) != 0 ? (
+    file_var(0, g_global_monmode);
+  );
+
   file_avail(0)>=0 ? ( // is reading config
     updatechfromrec();
     g_slider_sync = cfgp_sync[];
@@ -3267,7 +3273,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       !is_linked_idx(i) ? (
         mx = mon_x;
         my = row_cy - (mon_sz/2)|0;
-        rec[st_monmode] > 0 ? (
+        rec[st_monmode] == 2 ? (
+          // Always-on: lane-state bg + vivid monitor border
           rec[st_state] >= 2 ? set_color(C_LANE_REC) :
           rec[st_state] == 1 ? set_color(C_LANE_PLAY) :
                                set_color(C_LANE_STOP_CONT);
@@ -3275,7 +3282,13 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
           rec[st_state] >= 2 ? set_color(C_MON_REC_FG) :
           rec[st_state] == 1 ? set_color(C_MON_PLAY_FG) :
                                set_color(C_MON_STOP_FG);
+        ) : rec[st_monmode] == 1 ? (
+          // Auto/selected-only: dark bg + selection-blue border + icon
+          set_color(C_MON_OFF_BG);
+          gfx_rect(mx, my, mon_sz, mon_sz);
+          set_color(C_CONT_SEL);
         ) : (
+          // Off: near-black bg + barely-visible border + icon
           set_color(C_MON_OFF_BG);
           gfx_rect(mx, my, mon_sz, mon_sz);
           set_color(C_MON_OFF_FG);
@@ -3355,7 +3368,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       pair_wantr ? (
         mx = mon_x;
         my = row_y - (mon_sz/2)|0;
-        rec2[st_monmode] > 0 ? (
+        rec2[st_monmode] == 2 ? (
+          // Always-on: lane-state bg + vivid monitor border
           rec2[st_state] >= 2 ? set_color(C_LANE_REC) :
           rec2[st_state] == 1 ? set_color(C_LANE_PLAY) :
                                set_color(C_LANE_STOP_CONT);
@@ -3363,7 +3377,13 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
           rec2[st_state] >= 2 ? set_color(C_MON_REC_FG) :
           rec2[st_state] == 1 ? set_color(C_MON_PLAY_FG) :
                                set_color(C_MON_STOP_FG);
+        ) : rec2[st_monmode] == 1 ? (
+          // Auto/selected-only: dark bg + selection-blue border + icon
+          set_color(C_MON_OFF_BG);
+          gfx_rect(mx, my, mon_sz, mon_sz);
+          set_color(C_CONT_SEL);
         ) : (
+          // Off: near-black bg + barely-visible border + icon
           set_color(C_MON_OFF_BG);
           gfx_rect(mx, my, mon_sz, mon_sz);
           set_color(C_MON_OFF_FG);
@@ -3920,3 +3940,4 @@ strlen(#mainthread_todo) > 0 ? (
   mtc == 'e' ? export() :
   mtc == 'x' ? adjustsizes(1, 0);
 );
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
