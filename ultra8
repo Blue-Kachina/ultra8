@@ -106,7 +106,7 @@ g_pitch_buf_size = 2048;
 g_pitch_buf_size < (g_pitch_amdf_W + (srate/25|0) + 64) ? g_pitch_buf_size = 4096;
 g_pitch_buf_size < (g_pitch_amdf_W + (srate/25|0) + 64) ? g_pitch_buf_size = 8192;
 g_pitch_buf_size < (g_pitch_amdf_W + (srate/25|0) + 64) ? g_pitch_buf_size = 16384;
-g_maxlen = ((g_max_alloc - 4096 - g_latchq_len*3 - g_nchan*g_pitch_buf_size - 300)/(g_nchan*3))|0; // one-third each: active buffer, undo snapshot, redo snapshot
+g_maxlen = ((g_max_alloc - 4096 - g_latchq_len*3 - g_nchan*g_pitch_buf_size - 300)/(g_nchan*3 + 1))|0; // four regions: active buffer, undo, redo, plus one global scratch buffer
 g_infthreshdb = -120;
 g_infthresh = 10^(g_infthreshdb/20);
 g_latchmode=0;
@@ -141,10 +141,12 @@ st_redo_len  = 21; // samples stored in redo snapshot (0 = no redo available)
 st_loop_len      = 22; // committed loop length in samples (0 = empty / not yet set)
 st_undo_loop_len = 23; // loop length saved alongside the undo audio snapshot
 st_redo_loop_len = 24; // loop length saved alongside the redo audio snapshot
-st_loop_phase    = 25; // g_flex_pos value at which this lane's buffer position 0 begins
+st_loop_phase      = 25; // g_flex_pos value at which this lane's buffer position 0 begins
+st_undo_loop_phase = 28; // st_loop_phase saved alongside the undo audio snapshot
+st_redo_loop_phase = 29; // st_loop_phase saved alongside the redo audio snapshot
 // ─────────────────────────────────────────────────────────────────────────────
 st_disp_mult     = 26; // display amplitude multiplier (computed after recording; 1.0 = no boost)
-st_num = 28;
+st_num = 30;
 MAX_DISPLAY_MULT = 20.0; // waveform display boost cap (20x ~= +26 dB)
 
 // ── Command dispatch constants (Phase 2) ─────────────────────────────────────
@@ -230,8 +232,10 @@ function init(x, n1,n2,n3)
   rec[st_loop_len]      = 0;
   rec[st_undo_loop_len] = 0;
   rec[st_redo_loop_len] = 0;
-  rec[st_loop_phase]    = 0;
-  rec[st_disp_mult]     = 0; // no boost until first recording commits
+  rec[st_loop_phase]      = 0;
+  rec[st_undo_loop_phase] = 0;
+  rec[st_redo_loop_phase] = 0;
+  rec[st_disp_mult]       = 0; // no boost until first recording commits
 
   this.updatefromrec();
 );
@@ -588,6 +592,116 @@ function flex_commit_empty_lane_recording(idx, raw_len)
   g_sysex_dirty = 1;
 );
 
+// ── Phase-aligned empty-lane recording helpers ────────────────────────────────
+//
+// Generalized pipeline replacing the Flex-only g_flex_rec_* approach.
+// Applies to both non-Flex mode (committed = g_length) and Flex mode
+// (committed = quantize_flex_record_len(raw_len)).
+//
+// Usage sequence:
+//   begin_phase_aligned_empty_recording(idx)  — on recording start
+//   [process() writes linearly; g_phase_rec_raw_len increments each sample]
+//   commit_phase_aligned_empty_recording(idx, raw_len)  — on recording stop
+//   setstate_pair(idx, 1)  — enter playback (caller's responsibility)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Returns 1 when idx (or its pair owner) is the active phase-aligned recording.
+// Used by process() to bypass the normal write-position modulo.
+function is_phase_aligned_empty_recording(idx) (
+  g_phase_rec_owner_idx >= 0 && pair_owner_idx(idx) == g_phase_rec_owner_idx;
+);
+
+// Called when a later empty lane/pair starts recording after a base loop exists.
+// Captures the global-timeline start offset and resets the raw-length counter.
+// NOTE: set_need_zero(g_maxlen) must be called by the caller (it needs the
+// channel instance context that this function cannot access directly).
+function begin_phase_aligned_empty_recording(idx)
+  local(owner base_len)
+(
+  owner    = pair_owner_idx(idx);
+  base_len = is_flex_mode() ? g_flex_base_len : g_length;
+
+  g_phase_rec_owner_idx    = owner;
+  g_phase_rec_raw_len      = 0;
+  g_phase_rec_start_offset = base_len > 0 ? ((is_flex_mode() ? g_flex_pos : g_pos) % base_len) : 0;
+  g_phase_rec_flex         = is_flex_mode() ? 1 : 0;
+
+  // Phase metadata starts at 0; commit will also write 0, keeping lanes aligned.
+  set_effective_loop_phase(idx, 0);
+);
+
+// Determines the final committed length for a phase-aligned recording.
+// Non-Flex: always g_length (shared global timeline).
+// Flex: quantized to nearest multiple of g_flex_base_len.
+function get_committed_len_for_phase_recording(raw_len)
+  local(committed)
+(
+  g_phase_rec_flex ? (
+    committed = quantize_flex_record_len(raw_len);
+    committed <= 0 ? committed = raw_len; // safety: use raw if quantize fails
+    committed;
+  ) : (
+    g_length;
+  );
+);
+
+// Buffer-rotation commit for one lane.
+// Copies the linearly-captured take (buf[0..raw_len-1]) into the committed
+// buffer at the global phase offset, wrapping inside committed_len.
+// Uses g_phase_rec_tmp_buf as scratch to avoid in-place overwrite hazard.
+function phase_align_commit_one_lane(idx, raw_len, committed, start_off)
+  local(rec buf tmp copy_len i dest)
+(
+  rec      = mem_stlist + idx * st_num;
+  buf      = rec[st_buf];
+  tmp      = g_phase_rec_tmp_buf;
+  copy_len = min(raw_len, committed);
+
+  // 1. Save linear take to scratch (prevents src/dst overlap corruption).
+  memcpy(tmp, buf, copy_len);
+
+  // 2. Zero the full committed region so unrecorded positions are silence.
+  memset(buf, 0, committed);
+
+  // 3. Place each sample at its phase-aligned destination within committed_len.
+  i = 0;
+  loop(copy_len,
+    dest = (start_off + i) % committed;
+    buf[dest] = tmp[i];
+    i += 1;
+  );
+
+  rec[st_dirty]      = committed;
+  rec[st_loop_len]   = committed;
+  rec[st_loop_phase] = 0; // aligned: all 1x lanes share the global timeline
+);
+
+// Generalized commit for a phase-aligned empty-lane recording.
+// Rotates the linearly-captured take into the final buffer at the captured
+// start offset. Operates on both lanes of a linked pair. Clears phase-rec
+// globals. Caller must call setstate_pair(idx, 1) to enter playback.
+function commit_phase_aligned_empty_recording(idx, raw_len)
+  local(owner partner committed start_off)
+(
+  owner     = pair_owner_idx(idx);
+  partner   = pair_partner_idx(owner);
+  committed = get_committed_len_for_phase_recording(raw_len);
+  committed <= 0 ? committed = raw_len; // safety fallback
+  start_off = committed > 0 ? g_phase_rec_start_offset % committed : 0;
+
+  phase_align_commit_one_lane(owner, raw_len, committed, start_off);
+  partner >= 0 ? phase_align_commit_one_lane(partner, raw_len, committed, start_off);
+
+  set_effective_loop_len(idx, committed);
+  set_effective_loop_phase(idx, 0);
+
+  g_phase_rec_owner_idx    = -1;
+  g_phase_rec_raw_len      = 0;
+  g_phase_rec_start_offset = 0;
+
+  g_sysex_dirty = 1;
+);
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 function setstate(st) instance(fpos_slope, fpos2_slope, rec) local(dt)
@@ -610,15 +724,12 @@ function setstate(st) instance(fpos_slope, fpos2_slope, rec) local(dt)
         g_flex_pos = 0;
       );
 
-      // Phase 4: if this commit ends a Flex variable-length empty-lane recording,
-      // quantize the raw length, pad silence, and store st_loop_len.
-      // g_flex_rec_owner_idx == pair_owner_idx(this.idx) identifies the lane pair.
-      is_flex_mode() && g_flex_base_len > 0 &&
-          g_flex_rec_owner_idx >= 0 &&
-          g_flex_rec_owner_idx == pair_owner_idx(this.idx) ? (
-        flex_commit_empty_lane_recording(this.idx, g_flex_rec_raw_len);
-        g_flex_rec_owner_idx = -1;
-        g_flex_rec_raw_len   = 0;
+      // Generalized phase-aligned empty-lane recording commit.
+      // Handles both non-Flex (committed = g_length) and Flex (variable-length).
+      // setstate_pair(idx, 1) is called implicitly by the state transition below.
+      g_phase_rec_owner_idx >= 0 &&
+          g_phase_rec_owner_idx == pair_owner_idx(this.idx) ? (
+        commit_phase_aligned_empty_recording(this.idx, g_phase_rec_raw_len);
       );
     );
   ) : (
@@ -646,19 +757,16 @@ function setstate(st) instance(fpos_slope, fpos2_slope, rec) local(dt)
           );
         );
       ) : (
-        // Phase 4: second (or later) lane starting recording in Flex Mode.
-        // If Flex Mode is on, a base exists, and this lane is empty, this is a
-        // variable-length Flex recording — record the owner idx and reset the
-        // raw-length counter.  process() uses these to bypass the modulo wrap.
-        is_flex_mode() && has_flex_base() && st == 2 && rec[st_dirty] == 0 ? (
-          g_flex_rec_owner_idx = pair_owner_idx(this.idx);
-          g_flex_rec_raw_len   = 0;
-          set_effective_loop_phase(this.idx, g_flex_pos);
-          // Buffer at linear positions 0..g_maxlen may hold stale content from
-          // a prior recording (dt==0 so set_need_zero was skipped above). Schedule
-          // a full defensive zero so process_need_zero clears each position before
-          // the advancing Flex read pointer reaches it.  Zeroing runs 8x faster
-          // than l_pos advances, so it always stays ahead of the read pointer.
+        // Phase-aligned empty-lane recording: later empty lane starts recording
+        // after a base loop exists. Applies to both Flex Mode (variable-length
+        // commit) and non-Flex mode (committed length = g_length).
+        // begin_phase_aligned_empty_recording() captures the current global
+        // timeline offset so the take can be rotated into place at commit time.
+        (is_flex_mode() ? has_flex_base() : (g_length > 0 && g_firstrec == 0)) &&
+            st == 2 && rec[st_dirty] == 0 ? (
+          begin_phase_aligned_empty_recording(this.idx);
+          // Buffer may hold stale content from a prior recording (dt==0 so
+          // set_need_zero was skipped above). Schedule a full defensive zero.
           this.set_need_zero(g_maxlen);
         );
       );
@@ -705,18 +813,22 @@ function snapshot_pair(idx) local(oidx pidx orec prec) (
   orec[st_state] == 1 && orec[st_dirty] > 0 && orec[st_dirty] <= g_maxlen ? (
     memcpy(orec[st_undo_buf], orec[st_buf], orec[st_dirty]);
     orec[st_undo_len]      = orec[st_dirty];
-    orec[st_undo_loop_len] = orec[st_loop_len]; // Phase 7: save Flex lane length
-    orec[st_redo_len] = 0; // new overdub invalidates the redo stack
-    orec[st_redo_loop_len] = 0;
+    orec[st_undo_loop_len]   = orec[st_loop_len];   // Phase 7: save Flex lane length
+    orec[st_undo_loop_phase] = orec[st_loop_phase];  // save loop phase for restore
+    orec[st_redo_len]        = 0; // new overdub invalidates the redo stack
+    orec[st_redo_loop_len]   = 0;
+    orec[st_redo_loop_phase] = 0;
   );
   pidx >= 0 ? (
     prec = mem_stlist + pidx * st_num;
     prec[st_state] == 1 && prec[st_dirty] > 0 && prec[st_dirty] <= g_maxlen ? (
       memcpy(prec[st_undo_buf], prec[st_buf], prec[st_dirty]);
       prec[st_undo_len]      = prec[st_dirty];
-      prec[st_undo_loop_len] = prec[st_loop_len]; // Phase 7
-      prec[st_redo_len]      = 0;
-      prec[st_redo_loop_len] = 0;
+      prec[st_undo_loop_len]   = prec[st_loop_len]; // Phase 7
+      prec[st_undo_loop_phase] = prec[st_loop_phase];
+      prec[st_redo_len]        = 0;
+      prec[st_redo_loop_len]   = 0;
+      prec[st_redo_loop_phase] = 0;
     );
   );
 );
@@ -851,28 +963,26 @@ function process(s)
   l_pos    = get_lane_play_pos(idx);
   l_offs   = is_flex_mode() ? 0 : g_offs; // no user-offset in Flex Mode
 
-  // Phase 4: Flex variable-length empty-lane recording.
-  // When this lane is the designated Flex rec lane (g_flex_rec_owner_idx matches),
-  // override l_pos to the raw linear sample count so the write pointer never wraps.
-  // l_length is set large enough to suppress the modulo and rdc paths below.
-  // The raw-length counter advances here (inside process) so it counts every sample
-  // regardless of RDC or other adjustments.  Auto-stop at g_maxlen.
-  is_flex_mode() && pair_owner_idx(idx) == g_flex_rec_owner_idx && g_flex_rec_owner_idx >= 0 ? (
-    g_flex_rec_raw_len < g_maxlen ? (
+  // Phase-aligned empty-lane recording (non-Flex and Flex modes).
+  // Override l_pos to the raw linear sample count so the write pointer never
+  // wraps. l_length is set to g_maxlen to suppress the modulo and rdc paths.
+  // The raw-length counter advances here (inside process) so it counts every
+  // sample regardless of RDC or other adjustments. Auto-stop at g_maxlen.
+  pair_owner_idx(idx) == g_phase_rec_owner_idx && g_phase_rec_owner_idx >= 0 ? (
+    g_phase_rec_raw_len < g_maxlen ? (
       // Only the pair owner increments the raw-length counter; the linked partner
-      // reads back (raw_len - 1) so both channels write to the SAME sample position.
-      // Without this guard, both channels increment per-sample → 2× count, interleaved audio.
-      idx == g_flex_rec_owner_idx ? (
-        l_pos = g_flex_rec_raw_len;
-        g_flex_rec_raw_len += 1;
+      // reads (raw_len - 1) so both channels write to the SAME sample position.
+      // Without this guard, both channels would increment → 2× count, interleaved audio.
+      idx == g_phase_rec_owner_idx ? (
+        l_pos = g_phase_rec_raw_len;
+        g_phase_rec_raw_len += 1;
       ) : (
-        l_pos = g_flex_rec_raw_len - 1;  // owner already incremented; mirror same position
+        l_pos = g_phase_rec_raw_len - 1;  // owner already incremented; mirror same position
       );
-      l_length = g_maxlen;          // suppress modulo; real length committed on stop
+      l_length = g_maxlen; // suppress modulo; real length committed on stop
     ) : (
-      // Buffer full: auto-commit by pretending the user stopped recording.
-      // The commit will happen in the next setstate call (triggered from @block or @sample).
-      // For safety, freeze the write pointer at the last valid position.
+      // Buffer full: auto-commit will happen from @block.
+      // Freeze the write pointer at the last valid position until then.
       l_pos    = g_maxlen - 1;
       l_length = g_maxlen;
     );
@@ -969,10 +1079,12 @@ function clear_pair(idx) local(oidx pidx orec prec) (
   orec[st_dirty] = 0;
   orec[st_undo_len] = 0;
   orec[st_redo_len] = 0; // Unit 2.1: clear clears both undo and redo
-  orec[st_loop_len]      = 0; // Phase 1: Flex length reset on clear
-  orec[st_undo_loop_len] = 0;
-  orec[st_redo_loop_len] = 0;
-  orec[st_loop_phase]    = 0; // reset phase so re-recording captures a fresh start
+  orec[st_loop_len]        = 0; // Phase 1: Flex length reset on clear
+  orec[st_undo_loop_len]   = 0;
+  orec[st_redo_loop_len]   = 0;
+  orec[st_loop_phase]      = 0; // reset phase so re-recording captures a fresh start
+  orec[st_undo_loop_phase] = 0;
+  orec[st_redo_loop_phase] = 0;
   orec[st_disp_mult]     = 0; // reset display multiplier for fresh recording
   orec[st_div]           = 1; // reset subdivision; re-recording starts at full length
   // Clear partner when linked
@@ -983,10 +1095,12 @@ function clear_pair(idx) local(oidx pidx orec prec) (
     prec[st_dirty] = 0;
     prec[st_undo_len] = 0;
     prec[st_redo_len] = 0;
-    prec[st_loop_len]      = 0;
-    prec[st_undo_loop_len] = 0;
-    prec[st_redo_loop_len] = 0;
-    prec[st_loop_phase]    = 0;
+    prec[st_loop_len]        = 0;
+    prec[st_undo_loop_len]   = 0;
+    prec[st_redo_loop_len]   = 0;
+    prec[st_loop_phase]      = 0;
+    prec[st_undo_loop_phase] = 0;
+    prec[st_redo_loop_phase] = 0;
     prec[st_disp_mult]     = 0;
     prec[st_div]           = 1;
   );
@@ -1123,8 +1237,9 @@ function undo_pair(idx) local(oidx pidx orec prec) (
     // Restore from undo snapshot.
     memcpy(orec[st_buf], orec[st_undo_buf], orec[st_undo_len]);
     orec[st_dirty]     = orec[st_undo_len];
-    orec[st_loop_len]  = orec[st_undo_loop_len]; // Phase 7: restore Flex lane length
-    orec[st_disp_mult] = 0; // buffer changed; recompute display multiplier
+    orec[st_loop_len]   = orec[st_undo_loop_len];  // Phase 7: restore Flex lane length
+    orec[st_loop_phase] = orec[st_undo_loop_phase];  // restore loop phase
+    orec[st_disp_mult]  = 0; // buffer changed; recompute display multiplier
     <? loop(x=0;nch, printf("oidx == %d ? ch%d.dirty_top = orec[st_undo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
   );
   pidx >= 0 ? (
@@ -1135,8 +1250,9 @@ function undo_pair(idx) local(oidx pidx orec prec) (
       prec[st_redo_loop_len] = prec[st_loop_len];
       memcpy(prec[st_buf], prec[st_undo_buf], prec[st_undo_len]);
       prec[st_dirty]     = prec[st_undo_len];
-      prec[st_loop_len]  = prec[st_undo_loop_len]; // Phase 7
-      prec[st_disp_mult] = 0;
+      prec[st_loop_len]   = prec[st_undo_loop_len]; // Phase 7
+      prec[st_loop_phase] = prec[st_undo_loop_phase];
+      prec[st_disp_mult]  = 0;
       <? loop(x=0;nch, printf("pidx == %d ? ch%d.dirty_top = prec[st_undo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
     );
   );
@@ -1155,8 +1271,9 @@ function redo_pair(idx) local(oidx pidx orec prec) (
   orec[st_redo_len] > 0 ? (
     memcpy(orec[st_buf], orec[st_redo_buf], orec[st_redo_len]);
     orec[st_dirty]     = orec[st_redo_len];
-    orec[st_loop_len]  = orec[st_redo_loop_len]; // Phase 7: restore Flex lane length
-    orec[st_disp_mult] = 0; // buffer changed; recompute display multiplier
+    orec[st_loop_len]   = orec[st_redo_loop_len];  // Phase 7: restore Flex lane length
+    orec[st_loop_phase] = orec[st_redo_loop_phase];  // restore loop phase
+    orec[st_disp_mult]  = 0; // buffer changed; recompute display multiplier
     <? loop(x=0;nch, printf("oidx == %d ? ch%d.dirty_top = orec[st_redo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
     orec[st_redo_len]      = 0; // consume the redo snapshot
     orec[st_redo_loop_len] = 0;
@@ -1166,8 +1283,9 @@ function redo_pair(idx) local(oidx pidx orec prec) (
     prec[st_redo_len] > 0 ? (
       memcpy(prec[st_buf], prec[st_redo_buf], prec[st_redo_len]);
       prec[st_dirty]     = prec[st_redo_len];
-      prec[st_loop_len]  = prec[st_redo_loop_len]; // Phase 7
-      prec[st_disp_mult] = 0;
+      prec[st_loop_len]   = prec[st_redo_loop_len]; // Phase 7
+      prec[st_loop_phase] = prec[st_redo_loop_phase];
+      prec[st_disp_mult]  = 0;
       <? loop(x=0;nch, printf("pidx == %d ? ch%d.dirty_top = prec[st_redo_len] - 1 :\n",x,x+1); x+=1;) ?> 0;
       prec[st_redo_len]      = 0;
       prec[st_redo_loop_len] = 0;
@@ -1243,19 +1361,25 @@ function reset() local(lp)
     );
     lp[st_undo_len]      = 0; // kill-all drops undo snapshot
     lp[st_redo_len]      = 0; // kill-all drops redo snapshot
-    lp[st_loop_len]      = 0; // Phase 1: clear Flex lane length on kill-all
-    lp[st_undo_loop_len] = 0;
-    lp[st_redo_loop_len] = 0;
-    lp[st_loop_phase]    = 0;
+    lp[st_loop_len]        = 0; // Phase 1: clear Flex lane length on kill-all
+    lp[st_undo_loop_len]   = 0;
+    lp[st_redo_loop_len]   = 0;
+    lp[st_loop_phase]      = 0;
+    lp[st_undo_loop_phase] = 0;
+    lp[st_redo_loop_phase] = 0;
     lp[st_disp_mult]     = 0; // Unit A.1: reset display multiplier
     lp += st_num;
   );
   g_firstrec=g_offs=g_length=g_pos=0;
   // Phase 1: reset Flex Mode transport state (g_flex_enabled itself is preserved)
-  g_flex_base_len      = 0;
-  g_flex_pos           = 0;
-  g_flex_rec_owner_idx = -1;
-  g_flex_rec_raw_len   = 0;
+  g_flex_base_len          = 0;
+  g_flex_pos               = 0;
+  g_flex_rec_owner_idx     = -1;
+  g_flex_rec_raw_len       = 0;
+  g_phase_rec_owner_idx    = -1;
+  g_phase_rec_raw_len      = 0;
+  g_phase_rec_start_offset = 0;
+  g_phase_rec_flex         = 0;
 );
 
 
@@ -1892,6 +2016,20 @@ ext_noinit == 0 ? (
   // g_flex_rec_raw_len: running count of samples written into the flex rec lane.
   g_flex_rec_raw_len          = 0;
   // ─────────────────────────────────────────────────────────────────────────────
+  // ── Phase-aligned empty-lane recording globals ───────────────────────────────
+  // Generalized replacement for the Flex-only g_flex_rec_* globals.
+  // Active when any mode starts a later empty-lane recording after a base exists.
+  // g_phase_rec_owner_idx: pair owner of the recording lane (-1 = none active)
+  g_phase_rec_owner_idx        = -1;
+  // g_phase_rec_raw_len: linear samples written since recording began
+  g_phase_rec_raw_len          = 0;
+  // g_phase_rec_start_offset: global timeline position at recording start
+  g_phase_rec_start_offset     = 0;
+  // g_phase_rec_flex: 1 if this is a Flex recording, 0 if non-Flex
+  g_phase_rec_flex             = 0;
+  // g_phase_rec_tmp_buf: scratch buffer for commit-time buffer rotation (set below)
+  g_phase_rec_tmp_buf          = 0;
+  // ─────────────────────────────────────────────────────────────────────────────
   g_recstart_gate=0;
   g_prevent_processing = 0; // &1=gate, &2=sync mode
   g_chan_selected = -1; // currently selected channel
@@ -1912,6 +2050,9 @@ ext_noinit == 0 ? (
     i[st_redo_buf] = alloc(g_maxlen); // Unit 2.1: redo buffer
     i += st_num;
   );
+  // Global scratch buffer for phase-aligned commit-time buffer rotation.
+  // One g_maxlen region reused across all commits (commits never overlap).
+  g_phase_rec_tmp_buf = alloc(g_maxlen);
 
   // Register JSFX sliders with the PR library (required before any PR display calls)
   pr_sync     = PR.NewSlider(1, 0, 0, 2);   // slider1: sync mode (0=off, 1=project, 2=playback)
@@ -2248,15 +2389,13 @@ function onblock()
 
 <? loop(x=0;nch, printf("ch%d.onblock();\n",x+=1)) ?>
 
-// ── Flex max-buffer auto-commit (Phase 3 hardening) ─────────────────────────
-// When a Flex empty-lane recording fills the entire buffer, process() freezes
-// the write pointer but cannot commit (setstate is not safe from @sample).
+// ── Phase-aligned max-buffer auto-commit ──────────────────────────────────────
+// When a phase-aligned empty-lane recording fills the entire buffer, process()
+// freezes the write pointer but cannot commit (setstate is not safe from @sample).
 // Check here each block: if we are at the limit, commit and enter playback.
-is_flex_mode() && g_flex_rec_owner_idx >= 0 && g_flex_rec_raw_len >= g_maxlen ? (
-  flex_commit_empty_lane_recording(g_flex_rec_owner_idx, g_maxlen);
-  setstate_pair(g_flex_rec_owner_idx, 1); // enter playback
-  g_flex_rec_owner_idx = -1;
-  g_flex_rec_raw_len   = 0;
+g_phase_rec_owner_idx >= 0 && g_phase_rec_raw_len >= g_maxlen ? (
+  commit_phase_aligned_empty_recording(g_phase_rec_owner_idx, g_maxlen);
+  setstate_pair(g_phase_rec_owner_idx, 1); // enter playback
 );
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3262,7 +3401,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     last_show_controls != g_show_controls ||
     last_pulse != (g_sysex_period_rate > 0) ||
     last_flex != g_flex_enabled ||         // Phase 8: redraw on Flex Mode toggle
-    last_flex_rec != g_flex_rec_owner_idx; // Phase 8: redraw during live flex recording
+    last_flex_rec != g_phase_rec_owner_idx; // Phase 8: redraw during live phase-aligned recording
   lasthalve = cfgp_fade[];
   lastlen = g_length;
   lastoffs = g_offs;
@@ -3271,7 +3410,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   last_show_controls = g_show_controls;
   last_pulse = (g_sysex_period_rate > 0);
   last_flex = g_flex_enabled;           // Phase 8
-  last_flex_rec = g_flex_rec_owner_idx; // Phase 8
+  last_flex_rec = g_phase_rec_owner_idx; // Phase 8
   // Per-lane redraws (including the per-lane progress fills added in ultra_redesign.md)
   // use the peak-meter 20 Hz timer (`now > rec[st_lastpkupd] + 0.05`) rather than a
   // g_pos-driven force_redraw on every sample block.  This keeps UI CPU low while
@@ -3580,9 +3719,9 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       gfx_setfont(1, "Arial", mult_font_sz, 'b');
       rec[st_dirty] ? set_color(C_MULT_LABEL) : set_color(C_MULT_INACTIVE);
       is_flex_mode() ? (
-        i == g_flex_rec_owner_idx ? (
+        i == g_phase_rec_owner_idx && g_phase_rec_flex ? (
           g_flex_base_len > 0 ? (
-            sprintf(#_mtxt, "→%dx", max(1, ceil(g_flex_rec_raw_len / g_flex_base_len)));
+            sprintf(#_mtxt, "→%dx", max(1, ceil(g_phase_rec_raw_len / g_flex_base_len)));
           ) : (
             strcpy(#_mtxt, "REC");
           );
@@ -4124,8 +4263,12 @@ function draw_topbar(need_ref) local(s,i,t, lastlen, lastgate, lastlatch, lastcl
         g_flex_enabled = !g_flex_enabled;
         g_flex_base_len = 0;
         g_flex_pos = 0;
-        g_flex_rec_owner_idx = -1;
-        g_flex_rec_raw_len = 0;
+        g_flex_rec_owner_idx     = -1;
+        g_flex_rec_raw_len       = 0;
+        g_phase_rec_owner_idx    = -1;
+        g_phase_rec_raw_len      = 0;
+        g_phase_rec_start_offset = 0;
+        g_phase_rec_flex         = 0;
         sliderchange(-1); // persist g_flex_enabled via @serialize
         last_w = 0;       // force full redraw
       ) : pulse_button.hit_topbar_button(mouse_x,mouse_y,-1) ? (
