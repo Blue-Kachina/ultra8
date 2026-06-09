@@ -120,6 +120,7 @@ st_note_rev = 4; // reverse note
 st_note_clr = 17; // clear lane
 st_note_undo = 18; // undo lane
 st_note_mon = 19; // monitor two-state toggle
+st_note_tuner = 27; // tuner CC assignment (default 26)
 
 st_state = 5; // 0=off, 1=play, 2=recording
 st_buf   = 6; // pointer to audio buffer
@@ -143,7 +144,7 @@ st_redo_loop_len = 24; // loop length saved alongside the redo audio snapshot
 st_loop_phase    = 25; // g_flex_pos value at which this lane's buffer position 0 begins
 // ─────────────────────────────────────────────────────────────────────────────
 st_disp_mult     = 26; // display amplitude multiplier (computed after recording; 1.0 = no boost)
-st_num = 27;
+st_num = 28;
 MAX_DISPLAY_MULT = 20.0; // waveform display boost cap (20x ~= +26 dB)
 
 // ── Command dispatch constants (Phase 2) ─────────────────────────────────────
@@ -210,6 +211,7 @@ function init(x, n1,n2,n3)
   rec[st_note_clr] = 128; // CLR default off
   rec[st_note_undo] = 128; // UNDO default off
   rec[st_note_mon] = 128; // MON default off
+  rec[st_note_tuner] = 155; // TUN default CC26 (packed: 129+26)
   rec[st_state]=0;
   rec[st_lastd]=-1;
   rec[st_dirty]=0;
@@ -1290,7 +1292,7 @@ function estbpm(len) local(bpm, tsnum) global(ts_num, srate, cfgp_clickcnt)
 //                           one snapshot per block when set, then clears it
 
 function build_sysex_snapshot()
-  local(i, rec, lane_state, lane_dirty, lane_sel, lane_rev_active, lane_undo_redo, lane_flags, loop_phase)
+  local(i, rec, lane_state, lane_dirty, lane_sel, lane_rev_active, lane_undo_redo, lane_flags, loop_phase, lane_tuner_on)
 (
   // ── Header (bytes 0–3) ──────────────────────────────────────────────────────
   g_sysex_buf[0] = 0xF0;   // SysEx start
@@ -1339,11 +1341,13 @@ function build_sysex_snapshot()
                    : rec[st_undo_len] > 0 ? 1
                    : 0;
 
+    lane_tuner_on = (mem_tuner + i * tuner_num)[0];
     lane_flags = (lane_state      & 0x03)         // bits 1:0 — state enum
                | ((lane_dirty      & 0x01) << 2)  // bit 2    — dirty
                | ((lane_sel        & 0x01) << 3)  // bit 3    — selected
-               | ((lane_rev_active & 0x01) << 6); // bit 6    — reverse active (monmode removed)
-    // bits 5:4 = 0 (monmode removed in v0.2), bit 7 = 0 (7-bit MIDI safety)
+               | ((lane_tuner_on   & 0x01) << 4)  // bit 4    — tuner_enabled (Phase 8)
+               | ((lane_rev_active & 0x01) << 6); // bit 6    — reverse active
+    // bit 5 = 0 (reserved), bit 7 = 0 (7-bit MIDI safety)
 
     // Loop phase 0–127: fractional position through the loop.
     // Phase 9: In Flex Mode each lane uses its own length for phase calculation so
@@ -1482,7 +1486,7 @@ function build_assign_snapshot()
   g_assign_buf[4] = g_assign_seq & 0x7F;          // seq_lo: bits 6:0
   g_assign_buf[5] = (g_assign_seq >> 7) & 0x7F;   // seq_hi: bits 13:7
 
-  g_assign_buf[6] = 6;   // num_controls: always 6 (added REV as control ID 5)
+  g_assign_buf[6] = 7;   // num_controls: always 7 (added TUN as control ID 6)
 
   // ── Control blocks (bytes 7–24, 6 × 3 bytes) ───────────────────────────────
   // Format per block: [control_id, msg_type_byte, msg_number]
@@ -1512,8 +1516,11 @@ function build_assign_snapshot()
   g_assign_buf[22] = 5;   // Control 5: REV — control_id
   decode_assignment(g_snap_sel[st_note_rev], g_assign_buf, 23);
 
-  // ── SysEx end (byte 25) ─────────────────────────────────────────────────────
-  g_assign_buf[25] = 0xF7;
+  g_assign_buf[25] = 6;   // Control 6: TUN — control_id
+  decode_assignment(g_snap_sel[st_note_tuner], g_assign_buf, 26);
+
+  // ── SysEx end (byte 28) ─────────────────────────────────────────────────────
+  g_assign_buf[28] = 0xF7;
 );
 
 function emit_assign_snapshot()
@@ -1523,12 +1530,12 @@ function emit_assign_snapshot()
   g_assign_seq = (g_assign_seq + 1) & 0x3FFF;
 
   build_assign_snapshot();
-  midisend_buf(0, g_assign_buf, 26);
+  midisend_buf(0, g_assign_buf, 29);
 
   g_sysex_debug_enabled ? (
     printf("U8 ASSIGN seq=%d: ", g_assign_seq);
     di = 0;
-    loop(26,
+    loop(29,
       printf("%02X ", g_assign_buf[di] | 0);
       di += 1;
     );
@@ -1772,7 +1779,7 @@ ext_noinit == 0 ? (
   g_latchq = alloc(g_latchq_len*3);
   g_latchq_used=0;
 
-  mem_gen_sz=30;
+  mem_gen_sz=31;
   mem_gen_cfg = alloc(mem_gen_sz);
   memset(mem_gen_cfg,128,mem_gen_sz);
 
@@ -1800,6 +1807,7 @@ ext_noinit == 0 ? (
   cfgp_common_clr  = mem_gen_cfg + 21;
   cfgp_common_undo = mem_gen_cfg + 22;
   cfgp_common_rev  = mem_gen_cfg + 28;
+  cfgp_common_tun  = mem_gen_cfg + 30;
   mem_gen_cfg[23]  = 0; // g_show_globals: unused (always forced to 1 at runtime; common-mode dispatch is always on)
   mem_gen_cfg[24]  = 0; // g_show_controls: Advanced controls off by default
   mem_gen_cfg[29]  = 0; // g_pulse: SysEx heartbeat off by default (QoL 1.1)
@@ -1958,8 +1966,8 @@ ext_noinit == 0 ? (
   // ── Assignment Message Emitter — init (Unit 6.3) ────────────────────────────
   // g_assign_seq:    separate 14-bit counter from g_sysex_seq; 0 on boot; first
   //                  emitted packet = seq 1 (incremented before each emit)
-  // g_assign_buf:    26-float alloc block; one slot per MIDI byte (6 controls)
-  // g_assign_shadow: 6-float shadow of per-lane st_note_recply/2/5/7/6/4 for the
+  // g_assign_buf:    29-float alloc block; one slot per MIDI byte (7 controls)
+  // g_assign_shadow: 7-float shadow of per-lane st_note_recply/2/5/7/6/4/tun for the
   //                  currently selected lane (g_chan_selected), used by @block
   //                  to detect assignment changes between heartbeats.  Covers
   //                  both global header-row tweakers and per-lane row tweakers.
@@ -1968,14 +1976,15 @@ ext_noinit == 0 ? (
   //                  after emit_assign_snapshot().
   // Shares g_sysex_enabled and g_sysex_debug_enabled with the snapshot emitter.
   g_assign_seq = 0;
-  g_assign_buf = alloc(26);
-  g_assign_shadow    = alloc(6);
+  g_assign_buf = alloc(29);
+  g_assign_shadow    = alloc(7);
   g_assign_shadow[0] = -1;   // rec  — -1 forces emit on first block
   g_assign_shadow[1] = -1;   // ply
   g_assign_shadow[2] = -1;   // clr
   g_assign_shadow[3] = -1;   // mon
   g_assign_shadow[4] = -1;   // undo
   g_assign_shadow[5] = -1;   // rev
+  g_assign_shadow[6] = -1;   // tun
   g_assign_dirty = 0;
 
   // ── Timing Metadata Emitter init (Unit A.2) ────────────
@@ -1993,11 +2002,10 @@ ext_noinit == 0 ? (
   mem_tuner = alloc(g_nchan * tuner_num);
   memset(mem_tuner, 0, g_nchan * tuner_num);
   //
-  // g_tuner_cc:             raw CC number (26) for TUNER_ON/OFF commands
   // g_tuner_seq:            14-bit rolling sequence counter for tuner SysEx
   // g_tuner_buf:            16-float alloc block (one slot per MIDI byte)
   // g_tuner_period_counter: countdown in samples; fires at ~10 Hz
-  g_tuner_cc             = 26;
+  // (TUN CC is now per-lane: rec[st_note_tuner], default 26)
   g_tuner_seq            = 0;
   g_tuner_buf            = alloc(16);
   g_tuner_period_counter = (srate / 10) | 0;   // first fire ~100 ms after boot
@@ -2141,6 +2149,14 @@ function doconf() local(i,s) (
   // button shows the correct on/off state after project reload.
   file_avail(0) != 0 ? (
     file_var(0, g_global_monmode);
+  );
+
+  file_avail(0) != 0 ? ( // st_note_tuner — per-lane TUN CC assignment (appended, backward-compat)
+    i = mem_stlist;
+    loop(g_nchan,
+      file_var(0, i[st_note_tuner]);
+      i += st_num;
+    );
   );
 
   file_avail(0)>=0 ? ( // is reading config
@@ -2296,13 +2312,15 @@ g_sysex_enabled ? (
    g_eff_sel[st_note_clr] != g_assign_shadow[2] ||
    g_eff_sel[st_note_mon] != g_assign_shadow[3] ||
    g_eff_sel[st_note_undo] != g_assign_shadow[4] ||
-   g_eff_sel[st_note_rev] != g_assign_shadow[5]) ? (
+   g_eff_sel[st_note_rev] != g_assign_shadow[5] ||
+   g_eff_sel[st_note_tuner] != g_assign_shadow[6]) ? (
     g_assign_shadow[0] = g_eff_sel[st_note_recply];
     g_assign_shadow[1] = g_eff_sel[st_note_plystp];
     g_assign_shadow[2] = g_eff_sel[st_note_clr];
     g_assign_shadow[3] = g_eff_sel[st_note_mon];
     g_assign_shadow[4] = g_eff_sel[st_note_undo];
     g_assign_shadow[5] = g_eff_sel[st_note_rev];
+    g_assign_shadow[6] = g_eff_sel[st_note_tuner];
     g_assign_dirty = 1;
   );
   g_assign_dirty ? (
@@ -2427,23 +2445,27 @@ while (sidx == nextmsg_offs)
 (
   // Extract MIDI channel BEFORE CC/PC remap (which overwrites the status byte)
   g_msg_chan = (nextmsg_1 & 0x0F) + 1;
-  // ── Tuner CC26 intercept (before CC-to-note remap) ──────────────────────────
-  // CC26 value=127 -> TUNER_ON; CC26 value=0 -> TUNER_OFF.
+  // ── Tuner CC intercept (before CC-to-note remap) ────────────────────────────
+  // Per-lane st_note_tuner CC: value=127 -> TUNER_ON; value=0 -> TUNER_OFF.
   // Intercepted here so value=0 (OFF) is caught before the remap gate at the
   // next line (which discards CC value=0 via "nextmsg_3 >= 1").
   // After handling, nextmsg_3 is zeroed to suppress further common-mode dispatch.
-  (nextmsg_1 & 0xF0) == 0xB0 && nextmsg_2 == g_tuner_cc ? (
+  (nextmsg_1 & 0xF0) == 0xB0 ? (
     g_tuner_cmd_lane = -1;
     g_tuner_i = 0;
     loop(g_nchan,
-      (mem_stlist + g_tuner_i * st_num)[st_midichan] == g_msg_chan ? g_tuner_cmd_lane = g_tuner_i;
+      (mem_stlist + g_tuner_i * st_num)[st_midichan] == g_msg_chan &&
+      (mem_stlist + g_tuner_i * st_num)[st_note_tuner] >= 129 &&
+      (mem_stlist + g_tuner_i * st_num)[st_note_tuner] < 258 &&
+      nextmsg_2 == (mem_stlist + g_tuner_i * st_num)[st_note_tuner] - 129 ?
+        g_tuner_cmd_lane = g_tuner_i;
       g_tuner_i += 1;
     );
     g_tuner_cmd_lane >= 0 ? (
       nextmsg_3 == 0   ? handle_tuner_off(g_tuner_cmd_lane) :
       nextmsg_3 == 127 ? handle_tuner_on(g_tuner_cmd_lane);
+      nextmsg_3 = 0; // suppress CC-to-note remap and common-mode dispatch
     );
-    nextmsg_3 = 0; // suppress CC-to-note remap and common-mode dispatch
   );
   // ──────────────────────────────────────────────────────────────────────────────
 
@@ -2977,6 +2999,44 @@ function draw_speaker_clean(xpos, ypos, w, h)
     angle += da;
   );
 );
+function draw_tuner_icon(xpos, ypos, w, h)
+  local(mid tx1 tx2 tine_top tine_bot arc_r arc_cy stem_top stem_bot arc_steps angle da)
+(
+  // Tuning fork: two tines (top) + arc connecting their bases (curves downward) + stem.
+  // Parametric arc: x = mid + r*cos(π−θ), y = arc_cy + r*sin(θ), θ: 0 → π
+  // At θ=0: (mid−r, arc_cy) = left tine base; at θ=π: (mid+r, arc_cy) = right tine base.
+  mid      = xpos + w * 0.5;
+  tx1      = xpos + w * 0.25;   // left tine x
+  tx2      = xpos + w * 0.75;   // right tine x
+  tine_top = ypos + h * 0.04;
+  tine_bot = ypos + h * 0.48;
+  arc_r    = (tx2 - tx1) * 0.5;
+  arc_cy   = tine_bot;
+  stem_top = tine_bot + arc_r;
+  stem_bot = ypos + h * 0.96;
+
+  // Two tines: double-thick vertical lines
+  gfx_line(tx1,   tine_top, tx1,   tine_bot, 0);
+  gfx_line(tx1+1, tine_top, tx1+1, tine_bot, 0);
+  gfx_line(tx2,   tine_top, tx2,   tine_bot, 0);
+  gfx_line(tx2-1, tine_top, tx2-1, tine_bot, 0);
+
+  // Arc connecting tine bases (curves downward from left to right tine)
+  arc_steps = 8;
+  da    = $pi / arc_steps;
+  angle = 0;
+  loop(arc_steps,
+    gfx_line(mid + arc_r    *cos($pi-angle),    arc_cy + arc_r    *sin(angle),
+             mid + arc_r    *cos($pi-angle-da), arc_cy + arc_r    *sin(angle+da), 0);
+    gfx_line(mid + (arc_r-1)*cos($pi-angle),    arc_cy + (arc_r-1)*sin(angle),
+             mid + (arc_r-1)*cos($pi-angle-da), arc_cy + (arc_r-1)*sin(angle+da), 0);
+    angle += da;
+  );
+
+  // Stem: double-thick vertical line from arc bottom to icon bottom
+  gfx_line(mid,   stem_top, mid,   stem_bot, 0);
+  gfx_line(mid+1, stem_top, mid+1, stem_bot, 0);
+);
 
 function draw_topbar_button(xp, yp, str)
   instance(w,h,x,y)
@@ -3152,13 +3212,14 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   g_curpk g_curpk_h gs_x gs_y gs_sz gi
   lasthalve lastlen lastoffs lastchanlink last_flex last_flex_rec
   tweaker_w tweaker_h link_area_w extra_gap content_right r_pos
-  mon_sz mon_btn_x rec_x ply_x rev_x clr_x undo_x sel_x fad_x div_x rdc_x ch_x t_ypos
+  mon_sz mon_btn_x tun_btn_x rec_x ply_x rev_x clr_x undo_x sel_x fad_x div_x rdc_x ch_x t_ypos
   lane_ypos state_hover own_rec id_text
   num_w mult_w mult_font_sz
   link_btn_w link_btn_h link_x link_cx link_cy lk_r lk_sep
   spk_hi spk_icon_sz spk_icon_x spk_icon_y
   frac split wave_draw_w
-  pair_wantr mon_hit_y mon_hit_h mon_hit_rec)
+  pair_wantr mon_hit_y mon_hit_h mon_hit_rec
+  tun_x tun_mx tun_my tun_on tun_icon_sz tun_icon_x tun_icon_y tun_hit_y tun_hit_h tun_hit_lane_idx)
 (
   // ── Ultra8 Design Palette ─────────────────────────────────────────────────────
   C_BG_BASE        = 0x13171C;   // overall background
@@ -3256,6 +3317,8 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   r_pos = content_right - extra_gap;
   mon_x = r_pos - mon_sz;
   r_pos = mon_x - gap;
+  tun_x = r_pos - mon_sz;   // Tuner button: left of monitor button
+  r_pos = tun_x - gap;
 
   g_show_controls ? (
     // SHOW CONTROLS ON: compute all tweaker positions right-to-left
@@ -3276,13 +3339,15 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     r_pos = rec_x - extra_gap;
     ch_x = r_pos - tweaker_w;
     r_pos = ch_x - gap;
+    tun_btn_x = r_pos - tweaker_w;
+    r_pos = tun_btn_x - gap;
     mon_btn_x = r_pos - tweaker_w;
     r_pos = mon_btn_x - extra_gap;
   ) : (
     // SHOW CONTROLS OFF: hide all tweakers; waveform expands
     fad_x = -1; div_x = -1; rdc_x = -1; sel_x = -1;
     clr_x = -1; undo_x = -1; rev_x = -1; ply_x = -1;
-    rec_x = -1; ch_x = -1; mon_btn_x = -1;
+    rec_x = -1; ch_x = -1; mon_btn_x = -1; tun_btn_x = -1;
   );
 
   wave_x = state_x + state_w;
@@ -3318,6 +3383,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
     );
 
     mon_btn_x >= 0 ? draw_global_tweaker(mon_btn_x, ypos+6, cfgp_common_mon,  st_note_mon, force_redraw, "MON");
+    tun_btn_x >= 0 ? draw_global_tweaker(tun_btn_x, ypos+6, cfgp_common_tun,  st_note_tuner, force_redraw, "TUN");
 
     // Global monitor speaker button: 2-state (0=off, 2=always-on). Styled like per-lane.
     gs_x = mon_x; gs_y = ypos + 6; gs_sz = mon_sz;
@@ -3633,6 +3699,37 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
         draw_speaker_clean(spk_icon_x, spk_icon_y, spk_icon_sz, spk_icon_sz);
       );
 
+      // Tuner button: drawn here for unlinked lanes only.
+      // Linked pairs: tuner button drawn during laneB's iteration at the pair boundary.
+      !is_linked_idx(i) ? (
+        tun_mx = tun_x;
+        tun_my = row_cy - (mon_sz/2)|0;
+        tun_on = (mem_tuner + i * tuner_num)[0];
+        tun_on ? (
+          // Enabled: lane-state bg + vivid border + icon
+          rec[st_state] >= 2 ? set_color(C_LANE_REC) :
+          rec[st_state] == 1 ? set_color(C_LANE_PLAY) :
+                               set_color(C_LANE_STOP_CONT);
+          gfx_rect(tun_mx, tun_my, mon_sz, mon_sz);
+          rec[st_state] >= 2 ? set_color(C_MON_REC_FG) :
+          rec[st_state] == 1 ? set_color(C_MON_PLAY_FG) :
+                               set_color(C_MON_STOP_FG);
+        ) : (
+          // Disabled: near-black bg + barely-visible border + icon
+          set_color(C_MON_OFF_BG);
+          gfx_rect(tun_mx, tun_my, mon_sz, mon_sz);
+          set_color(C_MON_OFF_FG);
+        );
+        gfx_rect(tun_mx, tun_my, mon_sz, 1);
+        gfx_rect(tun_mx, tun_my+mon_sz-1, mon_sz, 1);
+        gfx_rect(tun_mx, tun_my, 1, mon_sz);
+        gfx_rect(tun_mx+mon_sz-1, tun_my, 1, mon_sz);
+        tun_icon_sz = mon_sz * 0.5;
+        tun_icon_x  = tun_mx + (mon_sz - tun_icon_sz) * 0.5;
+        tun_icon_y  = tun_my + (mon_sz - tun_icon_sz) * 0.5;
+        draw_tuner_icon(tun_icon_x, tun_icon_y, tun_icon_sz, tun_icon_sz);
+      );
+
     ) : (
       wantr = 0;
     );
@@ -3661,6 +3758,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       );
 
       mon_btn_x >= 0 ? draw_value_tweaker(mon_btn_x, t_ypos, t + st_note_mon, wantr, "MON");
+      tun_btn_x >= 0 ? draw_value_tweaker(tun_btn_x, t_ypos, t + st_note_tuner, wantr, "TUN");
     );
 
     // ── Pass D: Controls (tweakers, monitor icon) ───────────────────────────
@@ -3693,6 +3791,7 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
       );
 
       mon_btn_x >= 0 ? draw_value_tweaker(mon_btn_x, t_ypos, t + st_note_mon, pair_wantr, "MON");
+      tun_btn_x >= 0 ? draw_value_tweaker(tun_btn_x, t_ypos, t + st_note_tuner, pair_wantr, "TUN");
 
       // Phase 6: draw laneA monitor icon at boundary (moved out of link-button block)
       pair_wantr ? (
@@ -3727,6 +3826,34 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
         spk_icon_y = my + (mon_sz - spk_icon_sz) * 0.5;
         draw_speaker_clean(spk_icon_x, spk_icon_y, spk_icon_sz, spk_icon_sz);
       );
+
+      // Tuner button: drawn at pair boundary during laneB's iteration.
+      pair_wantr ? (
+        tun_mx = tun_x;
+        tun_my = row_y - (mon_sz/2)|0;
+        tun_on = (mem_tuner + (i-1) * tuner_num)[0];
+        tun_on ? (
+          rec2[st_state] >= 2 ? set_color(C_LANE_REC) :
+          rec2[st_state] == 1 ? set_color(C_LANE_PLAY) :
+                               set_color(C_LANE_STOP_CONT);
+          gfx_rect(tun_mx, tun_my, mon_sz, mon_sz);
+          rec2[st_state] >= 2 ? set_color(C_MON_REC_FG) :
+          rec2[st_state] == 1 ? set_color(C_MON_PLAY_FG) :
+                               set_color(C_MON_STOP_FG);
+        ) : (
+          set_color(C_MON_OFF_BG);
+          gfx_rect(tun_mx, tun_my, mon_sz, mon_sz);
+          set_color(C_MON_OFF_FG);
+        );
+        gfx_rect(tun_mx, tun_my, mon_sz, 1);
+        gfx_rect(tun_mx, tun_my+mon_sz-1, mon_sz, 1);
+        gfx_rect(tun_mx, tun_my, 1, mon_sz);
+        gfx_rect(tun_mx+mon_sz-1, tun_my, 1, mon_sz);
+        tun_icon_sz = mon_sz * 0.5;
+        tun_icon_x  = tun_mx + (mon_sz - tun_icon_sz) * 0.5;
+        tun_icon_y  = tun_my + (mon_sz - tun_icon_sz) * 0.5;
+        draw_tuner_icon(tun_icon_x, tun_icon_y, tun_icon_sz, tun_icon_sz);
+      );
     );
 
     // Monitor hit test — Phase 7: outer guard suppresses linked laneA entirely.
@@ -3757,6 +3884,26 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
         );
         updatechfromrec();
         sliderchange(-1);
+      );
+    );
+
+    // Tuner button hit test — binary toggle: call handle_tuner_on/off.
+    (!is_linked_idx(i) || (i & 1)) ? (
+      !is_linked_idx(i) ? (
+        tun_hit_y        = row_y;
+        tun_hit_h        = lane_h;
+        tun_hit_lane_idx = i;
+      ) : (
+        // linked laneB: button sits on pair boundary; lane_idx = laneA owner (i-1)
+        tun_hit_y        = row_y - (mon_sz / 2)|0;
+        tun_hit_h        = mon_sz;
+        tun_hit_lane_idx = i - 1;
+      );
+      ((mouse_cap&1) && !(last_mouse_cap&1) || (mouse_cap&2) && !(last_mouse_cap&2)) && !cap_mode &&
+          mouse_in(tun_x, tun_hit_y, mon_sz, tun_hit_h) ? (
+        (mem_tuner + tun_hit_lane_idx * tuner_num)[0] ?
+          handle_tuner_off(tun_hit_lane_idx) :
+          handle_tuner_on(tun_hit_lane_idx);
       );
     );
 
