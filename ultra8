@@ -101,7 +101,7 @@ g_max_alloc = __memtop(); // JSFX memory available
 g_latchq_len = 1024; // 1024 midi events queueable for latch mode
 // Pitch detection buffer size: smallest power of 2 >= AMDF_W + tau_max + headroom.
 // Must be set before g_maxlen so the audio buffer formula accounts for it.
-g_pitch_amdf_W = 64;   // AMDF window (reduced from 512 for performance)
+g_pitch_amdf_W = 128;  // AMDF window: wider for more reliable pitch detection
 g_pitch_buf_size = 2048;
 g_pitch_buf_size < (g_pitch_amdf_W + (srate/25|0) + 64) ? g_pitch_buf_size = 4096;
 g_pitch_buf_size < (g_pitch_amdf_W + (srate/25|0) + 64) ? g_pitch_buf_size = 8192;
@@ -1683,7 +1683,7 @@ function detect_pitch(lane_idx)
   local(
     result_base buf_base write_pos read_start
     tau_min tau_max tau tau_step W
-    best_tau best_amdf worst_amdf amdf_sum
+    best_tau best_amdf worst_amdf amdf_sum candidate_tau
     i pos_n pos_ntau
     f midi_exact note_round note_name octave_byte
     cents_f cents_mag cents_sign
@@ -1748,6 +1748,25 @@ function detect_pitch(lane_idx)
     // Pure tone → best≈0, worst is large → confidence→127.
     // Noise     → best≈worst          → confidence→0.
     // No rms_est dependency — robust to transient peaks.
+    // Octave-down bias: prefer fundamental over 2nd harmonic.
+    // If best_tau * 2 is in the valid range and its AMDF is <= 1.5x the
+    // current winner, prefer the lower frequency (string fundamental).
+    candidate_tau = best_tau * 2;
+    candidate_tau <= tau_max ? (
+      amdf_sum = 0;
+      i = 0;
+      loop(W,
+        pos_n    = (read_start + i)                 & (g_pitch_buf_size - 1);
+        pos_ntau = (read_start + i + candidate_tau) & (g_pitch_buf_size - 1);
+        amdf_sum += abs(buf_base[pos_n] - buf_base[pos_ntau]);
+        i += 1;
+      );
+      amdf_sum <= best_amdf * 1.5 ? (
+        best_tau  = candidate_tau;
+        best_amdf = amdf_sum;
+      );
+    );
+
     worst_amdf > 0 ? (
       confidence = (127 * (1 - best_amdf / worst_amdf)) | 0;
       confidence < 0   ? confidence = 0;
@@ -1784,7 +1803,7 @@ function detect_pitch(lane_idx)
     // Stable = same semitone for 5 consecutive 10 Hz detections (~500 ms).
     prev_note  = mem_pitch_prev_note[lane_idx]   | 0;
     stab_count = mem_pitch_stab_count[lane_idx]  | 0;
-    note_round == prev_note ? (
+    (note_round == prev_note && confidence >= 20) ? (
       stab_count += 1;
     ) : (
       stab_count = 0;
@@ -1867,6 +1886,10 @@ function handle_tuner_off(lane_idx) local(rec trec pidx) (
 );
 
 function handle_tuner_on(lane_idx) local(rec trec pidx steal_i steal_trec) (
+  // For linked pairs always operate on laneA (left channel / pair owner).
+  // Guarantees pitch detection taps the left input regardless of which lane's
+  // MIDI channel fired the tuner CC.
+  lane_idx = pair_owner_idx(lane_idx);
   rec  = mem_stlist + lane_idx * st_num;
   trec = mem_tuner  + lane_idx * tuner_num;
   // Block entry during recording or overdubbing (st_state == 2 covers both)
