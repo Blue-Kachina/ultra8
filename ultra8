@@ -4518,37 +4518,22 @@ function draw_trim_waveform(xpos, ypos, w, h, chan, isend)
 function gcd(a, b) local(t) ( while (b > 0) ( t = b; b = a % b; a = t; ); a; );
 function lcm(a, b) local(g) ( g = gcd(a|0, b|0); g > 0 ? (a|0) / g * (b|0) : 0; );
 
-// Add To Project — Flex-aware tiling export.
+// Add To Project — lego-block export.
 //
-// Each lane is tiled so that the total exported duration equals the LCM of all
-// active lane lengths.  In Flex mode this reproduces the looper’s steady-state
-// playback exactly: a 1× lane repeats 6× inside a 6× total when combined with
-// 2× and 3× lanes; they all lock up to the same grid.  In non-Flex mode the
-// LCM collapses to g_length, so a div=2 lane gets 2 copies, div=1 gets 1, etc.
+// Each active lane is exported as a single item covering exactly its own loop
+// length.  Users tile/loop items in the DAW to fill longer super-cycles.
 //
-// Phase rotation: in Flex mode st_loop_phase records the g_flex_pos at which
-// buffer position 0 was captured.  We rotate the read start so that the first
-// exported sample corresponds to global beat-0.  The first rep is split into a
-// tail chunk [rotation..l-1] then a head chunk [0..rotation-1]; subsequent reps
-// are exported whole.  In non-Flex mode g_offs fills the same role.
+// Phase alignment guarantees st_loop_phase == 0 for every lane (buffer
+// position 0 == beat-0), so exported items land on the grid without rotation.
+// In non-Flex mode g_length/st_div gives the equivalent length.
 function export()  local(rec, first_flag, tidx, idx, ster, l, ch2off)
 (
-  // Export each active lane as exactly one item (the lane's own loop length).
-  // Users repeat/loop items in the DAW to fill longer cycles -- the "lego block" model.
-  //
   // Placement flags:
-  //   (1<<16)|(2<<16) -- first item of the first track: place at project end, set tempo.
-  //   0               -- first item of every subsequent track: at cursor (same start time).
+  //   (1<<16)|(2<<16) -- first track item: place at project end, set tempo.
+  //   0               -- all subsequent tracks: at cursor (same start time, stacked).
   //
-  // NOTE: 1<<16 ("after last item in project") is intentionally NOT used for secondary
-  // tracks because it is project-wide, not per-track.  Using it on track 2+ would chain
-  // each track after the previous one rather than stacking them at the same start time.
-  //
-  // Each lane is exported directly from rec[st_buf][0..l-1].  For lanes with a phase
-  // offset (rotation > 0) the content starts at musical time `rotation` rather than 0,
-  // but since export_buffer_to_project is asynchronous, pre-rendering into a scratch
-  // buffer and then zeroing it would corrupt the data before Reaper reads it.  Flex
-  // lanes are typically recorded at loop boundaries so rotation is zero or negligible.
+  // NOTE: 1<<16 is project-wide, not per-track.  Using it on track 2+ would chain
+  // each track after the previous rather than aligning them at the same position.
 
   g_length > 0 ? (
     rec = mem_stlist;
