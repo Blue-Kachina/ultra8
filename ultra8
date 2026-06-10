@@ -1885,7 +1885,7 @@ function handle_tuner_off(lane_idx) local(rec trec pidx) (
   );
 );
 
-function handle_tuner_on(lane_idx) local(rec trec pidx steal_i steal_trec) (
+function handle_tuner_on(lane_idx) local(rec trec pidx) (
   // For linked pairs always operate on laneA (left channel / pair owner).
   // Guarantees pitch detection taps the left input regardless of which lane's
   // MIDI channel fired the tuner CC.
@@ -1894,15 +1894,6 @@ function handle_tuner_on(lane_idx) local(rec trec pidx steal_i steal_trec) (
   trec = mem_tuner  + lane_idx * tuner_num;
   // Block entry during recording or overdubbing (st_state == 2 covers both)
   rec[st_state] != 2 && trec[0] == 0 ? (
-    // Phase 5: one-active-tuner policy — steal focus from any other active tuner lane.
-    steal_i = 0;
-    loop(g_nchan,
-      steal_i != lane_idx ? (
-        steal_trec = mem_tuner + steal_i * tuner_num;
-        steal_trec[0] ? handle_tuner_off(steal_i);
-      );
-      steal_i += 1;
-    );
     trec[1] = rec[st_monmode];    // save previous monitor mode (owner)
     rec[st_monmode] = 0;          // mute live monitoring (tuner-mode suppression)
     // Sync linked partner lane if present
