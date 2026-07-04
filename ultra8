@@ -839,16 +839,25 @@ function select_pair(idx) (
 );
 
 // ── Common-mode action helpers ────────────────────────────────────────────────
-// REC/PLY: recording→play; stopped/empty→record; playing→record/overdub.
+// REC/PLY: recording→play; stopped+content→overdub; stopped/empty→record; playing→record/overdub.
 // Saves a pre-overdub undo snapshot when entering record from an existing loop.
+// Stopped-with-content transitions through PLAYING first so setstate() takes
+// the playing→recording (overdub) path, not the first-pass path that resets globals.
 function common_recply_pair(idx) local(oidx orec newstate) (
   oidx = pair_owner_idx(idx);
   orec = mem_stlist + oidx * st_num;
 
-  newstate = orec[st_state] == 2 ? 1 : 2;
-
-  newstate == 2 ? snapshot_pair(oidx);
-  setstate_pair(oidx, newstate);
+  orec[st_state] == 0 && pair_has_content(oidx) ? (
+    // Stopped with content: go PLAYING then immediately RECORDING so we hit
+    // the overdub code path in setstate() instead of the first-pass reset.
+    setstate_pair(oidx, 1);
+    snapshot_pair(oidx);
+    setstate_pair(oidx, 2);
+  ) : (
+    newstate = orec[st_state] == 2 ? 1 : 2;
+    newstate == 2 ? snapshot_pair(oidx);
+    setstate_pair(oidx, newstate);
+  );
   select_pair(oidx);
 );
 
