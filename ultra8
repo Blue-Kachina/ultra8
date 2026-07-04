@@ -325,6 +325,20 @@ function pair_has_content(idx) local(oidx pidx orec prec has) (
 );
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Returns non-zero if ANY lane across the whole looper (not just one pair)
+// currently has recorded content (st_dirty > 0). Used by clear_pair() to
+// detect whether clearing a lane/pair has left the entire looper empty, so
+// global transport state can be fully reset (see reset()).
+function any_lane_has_content() local(lp found) (
+  found = 0;
+  lp = mem_stlist;
+  loop(g_nchan,
+    lp[st_dirty] > 0 ? found = 1;
+    lp += st_num;
+  );
+  found;
+);
+
 // ── Flex Mode helpers (Phase 1 / Phase 2) ────────────────────────────────────
 
 // Returns non-zero when Flex Mode is active.
@@ -1076,6 +1090,45 @@ function reverse_pair(idx) local(oidx pidx) (
   );
 );
 
+// Full "KILL" reset: stops every lane, wipes all recorded content and
+// undo/redo/Flex transport state. Moved here (before clear_pair) so
+// clear_pair() can call it directly without a forward-reference error --
+// this file's convention requires a function to be defined before anything
+// that calls it (see other "Defined here (after ...)" comments below).
+function reset() local(lp)
+(
+  g_chan_selected=-1;
+  // setstate() will latch dirty_top to st_dirty
+  <? loop(x=0;nch, x+=1; printf("ch%d.setstate(0); ch%d.rev_stop(); ch%d.rev_active=0; ch%d.dirty_top=-1;\n",x,x,x,x)) ?>
+  lp = mem_stlist;
+  loop(g_nchan,
+    lp[st_dirty] > 0 ? (
+      memset(lp[st_buf], 0, lp[st_dirty]);
+      lp[st_dirty] = 0;
+    );
+    lp[st_undo_len]      = 0; // kill-all drops undo snapshot
+    lp[st_redo_len]      = 0; // kill-all drops redo snapshot
+    lp[st_loop_len]        = 0; // Phase 1: clear Flex lane length on kill-all
+    lp[st_undo_loop_len]   = 0;
+    lp[st_redo_loop_len]   = 0;
+    lp[st_loop_phase]      = 0;
+    lp[st_undo_loop_phase] = 0;
+    lp[st_redo_loop_phase] = 0;
+    lp[st_disp_mult]     = 0; // Unit A.1: reset display multiplier
+    lp += st_num;
+  );
+  g_firstrec=g_offs=g_length=g_pos=0;
+  // Phase 1: reset Flex Mode transport state (g_flex_enabled itself is preserved)
+  g_flex_base_len          = 0;
+  g_flex_pos               = 0;
+  g_flex_rec_owner_idx     = -1;
+  g_flex_rec_raw_len       = 0;
+  g_phase_rec_owner_idx    = -1;
+  g_phase_rec_raw_len      = 0;
+  g_phase_rec_start_offset = 0;
+  g_phase_rec_flex         = 0;
+);
+
 // Clear both lanes of a pair: stop, zero buffer, drop undo snapshot.
 // Defined here (after rev_stop) to avoid forward-reference errors.
 function clear_pair(idx) local(oidx pidx orec prec) (
@@ -1114,6 +1167,11 @@ function clear_pair(idx) local(oidx pidx orec prec) (
     prec[st_div]           = 1;
   );
   is_flex_mode() ? recalc_flex_base_len();
+
+  // If clearing this pair has left the entire looper empty, also run the
+  // same global reset the KILL button performs, so no stale loop length,
+  // position, or Flex state lingers when there is nothing left to play.
+  !any_lane_has_content() ? reset();
 );
 
 function onmsg(m1,m2,m3) instance(rec,note,note2,note3,note4,note5,note6,note7)
@@ -1356,41 +1414,6 @@ function execute_lane_command(cmd, lane_idx, source) (
   cmd == CMD_PLAY_ALL  ? play_or_stop_all() :
   0; // CMD_SEL and unknown commands: no-op here; caller handles
 );
-
-function reset() local(lp)
-(
-  g_chan_selected=-1;
-  // setstate() will latch dirty_top to st_dirty
-  <? loop(x=0;nch, x+=1; printf("ch%d.setstate(0); ch%d.rev_stop(); ch%d.rev_active=0; ch%d.dirty_top=-1;\n",x,x,x,x)) ?>
-  lp = mem_stlist;
-  loop(g_nchan,
-    lp[st_dirty] > 0 ? (
-      memset(lp[st_buf], 0, lp[st_dirty]);
-      lp[st_dirty] = 0;
-    );
-    lp[st_undo_len]      = 0; // kill-all drops undo snapshot
-    lp[st_redo_len]      = 0; // kill-all drops redo snapshot
-    lp[st_loop_len]        = 0; // Phase 1: clear Flex lane length on kill-all
-    lp[st_undo_loop_len]   = 0;
-    lp[st_redo_loop_len]   = 0;
-    lp[st_loop_phase]      = 0;
-    lp[st_undo_loop_phase] = 0;
-    lp[st_redo_loop_phase] = 0;
-    lp[st_disp_mult]     = 0; // Unit A.1: reset display multiplier
-    lp += st_num;
-  );
-  g_firstrec=g_offs=g_length=g_pos=0;
-  // Phase 1: reset Flex Mode transport state (g_flex_enabled itself is preserved)
-  g_flex_base_len          = 0;
-  g_flex_pos               = 0;
-  g_flex_rec_owner_idx     = -1;
-  g_flex_rec_raw_len       = 0;
-  g_phase_rec_owner_idx    = -1;
-  g_phase_rec_raw_len      = 0;
-  g_phase_rec_start_offset = 0;
-  g_phase_rec_flex         = 0;
-);
-
 
 function estbpm(len) local(bpm, tsnum) global(ts_num, srate, cfgp_clickcnt)
 (
