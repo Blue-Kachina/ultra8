@@ -1,7 +1,8 @@
 desc:Ultra8 Looper
 // @author Blue Kachina
-// @version 1.0.1
+// @version 1.0.2
 // @changelog
+//   1.0.2: Add tags (looper, loop, sampler, multitrack) for ReaPack categorization.
 //   1.0.1: Fix ReaPack indexing (package was silently excluded after a
 //          provides/file-ownership conflict with a bundled library's demo
 //          file; force reindex now that the conflict is resolved).
