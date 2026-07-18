@@ -1,4 +1,18 @@
 desc:Ultra8 Looper
+// @author Blue Kachina
+// @version 1.0.1
+// @changelog
+//   1.0.1: Fix ReaPack indexing (package was silently excluded after a
+//          provides/file-ownership conflict with a bundled library's demo
+//          file; force reindex now that the conflict is resolved).
+//   1.0.0: Initial ReaPack release.
+// @about
+//   Ultra8 is a multi-lane looper designed for use in REAPER.
+provides:
+  philranger_GUI and Audio Library/PhilRangerAudioLibraryAlpha5.jsfx-inc
+  philranger_GUI and Audio Library/Knob.png
+  philranger_GUI and Audio Library/Highlight.png
+  philranger_GUI and Audio Library/Switch.png
 
 // Copyright (C) 2015 and onward Cockos Inc
 // LICENSE: LGPL v2 or later - http://www.gnu.org/licenses/lgpl.html
@@ -64,17 +78,13 @@ desc:Ultra8 Looper
 //   (useful for hand-shortages)
 // - latch: wait to run commands until next loop iteration
 
-provides:
-  philranger_GUI and Audio Library/PhilRangerAudioLibraryAlpha5.jsfx-inc
-  philranger_GUI and Audio Library/Knob.png
-  philranger_GUI and Audio Library/Highlight.png
-  philranger_GUI and Audio Library/Switch.png
-
 import PhilRangerAudioLibraryAlpha5.jsfx-inc
 
 filename:0,philranger_GUI and Audio Library/Highlight.png
 filename:1,philranger_GUI and Audio Library/Knob.png
 filename:2,philranger_GUI and Audio Library/Switch.png
+
+tags: looper loop sampler multitrack
 
 <? nch < 1 ? nch = 8 ?>
 <? maxmem < 8 ? maxmem = 256 ?>
@@ -4598,4 +4608,3 @@ strlen(#mainthread_todo) > 0 ? (
   mtc == 'e' ? export() :
   mtc == 'x' ? adjustsizes(1, 0);
 );
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
