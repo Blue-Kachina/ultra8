@@ -1990,7 +1990,7 @@ ext_noinit == 0 ? (
   cfgp_common_rev  = mem_gen_cfg + 28;
   cfgp_common_tun  = mem_gen_cfg + 30;
   mem_gen_cfg[23]  = 0; // g_show_globals: unused (always forced to 1 at runtime; common-mode dispatch is always on)
-  mem_gen_cfg[24]  = 0; // g_show_controls: Advanced controls off by default
+  mem_gen_cfg[24]  = 1; // g_show_controls: Advanced controls + globals panel ON by default (changed 2026-08-02: was 0, panel was effectively invisible on first launch)
   mem_gen_cfg[29]  = 0; // g_pulse: SysEx heartbeat off by default (QoL 1.1)
   cfgp_common_rdc  = mem_gen_cfg + 25;
   cfgp_common_div  = mem_gen_cfg + 26;
@@ -2031,7 +2031,7 @@ ext_noinit == 0 ? (
   // disabled. Today it simply means "common-mode MIDI dispatch is active"; the
   // UI visibility toggle is g_show_controls (formerly g_show_advanced).
   g_show_globals = 1;       // permanent; never set to 0
-  g_show_controls = 0;      // Advanced controls off by default (synced from mem_gen_cfg[24] after serialize)
+  g_show_controls = 1;      // Advanced controls + globals panel ON by default (synced from mem_gen_cfg[24] after serialize)
   g_lane_clear_req = 0;
   g_lane_undo_req = 0;
   g_lane_redo_req = 0; // Unit 2.1
