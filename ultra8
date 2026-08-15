@@ -99,7 +99,7 @@ out_pin:click output
 config: nch "Channels" 8 1 2 4 8="8 (namesake)" 12 16 24 32 48
 config: maxmem "Memory Size -preserve-config" 256 64="64MB - max length 0:23 for 8 channels @ 44.1kHz" 128="128MB - max length 0:47 for 8 channels @ 44.1kHz" 256="256MB (default) - max length 1:35 for 8 channels @ 44.1kHz" 512="512MB - max length 3:10 for 8 channels @ 44.1kHz" 1024="1GB - max length 6:20 for 8 channels @ 44.1kHz"
 
-options: maxmem=<? printf("%d",maxmem*1024*128); ?> no_meter gfx_idle prealloc=* 
+options: maxmem=<? printf("%d",maxmem*1024*128); ?> no_meter gfx_idle prealloc=*
 
 slider1:g_slider_sync=0<0,2,1{off,project,playback}>-Sync
 slider4:g_slider_click_cnt=0<0,64,1>-Click count/length
@@ -1960,7 +1960,7 @@ ext_noinit == 0 ? (
   g_latchq = alloc(g_latchq_len*3);
   g_latchq_used=0;
 
-  mem_gen_sz=31;
+  mem_gen_sz=32;   // slot 31 reserved (formerly g_daw_lane_enabled, removed; DAW Lane Mode shelved, see D-018)
   mem_gen_cfg = alloc(mem_gen_sz);
   memset(mem_gen_cfg,128,mem_gen_sz);
 
@@ -2253,6 +2253,44 @@ ext_noinit == 0 ? (
   mem_silence_buf = alloc(g_maxlen * 2);
   memset(mem_silence_buf, 0, g_maxlen * 2);
   // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── Ultra8 Design Palette ─────────────────────────────────────────────────────
+  // Must be set here (not just inside draw()) because draw_topbar() runs before
+  // draw() on every @gfx frame and reads C_BG_TOPBAR/C_PILL_*. Leaving these
+  // uninitialized until draw()'s first call made the topbar render black-on-black
+  // (all constants defaulting to 0) until something forced a topbar redraw.
+  C_BG_BASE        = 0x13171C;   // overall background
+  C_BG_TOPBAR      = 0x13171C;   // top bar background
+  C_LANE_REC       = 0x2B1415;   // recording/overdub: dark red
+  C_LANE_PLAY      = 0x152116;   // playing: dark green
+  C_LANE_STOP_CONT = 0x13171C;   // stopped with content: main UI
+  C_LANE_EMPTY     = 0x13171C;   // empty lane: main UI
+  C_CONT_REC       = 0x44191B;   // recording highlight
+  C_CONT_PLAY      = 0x1F341C;   // playback highlight
+  C_CONT_STOP      = 0x1D242C;   // stopped contour: main UI highlight
+  C_CONT_SEL       = 0x7080E0;   // selected contour
+  C_WAVE_TROUGH    = 0x0E0E1E;   // waveform sub-panel bg
+  C_WAVE_PLAYED    = 0xCCCCCC;   // played: near-white
+  C_WAVE_UNPLAYED  = 0x787C98;   // unplayed: mid cool-grey
+  C_PROG_PLAY      = 0x1F341C;   // playing progress fill (playback highlight)
+  C_PROG_REC       = 0x44191B;   // recording progress fill (recording highlight)
+  C_PROG_STOP      = 0x1D242C;   // stopped progress fill (main UI highlight)
+  C_MON_OFF_BG  = 0x0C0C12;   // monitor off: near-black bg
+  C_MON_OFF_FG  = 0x2A2A3C;   // monitor off: barely-visible border + icon
+  C_MON_REC_FG  = 0xD83535;   // monitor on + recording: vivid red
+  C_MON_PLAY_FG = 0x35D050;   // monitor on + playing: vivid green
+  C_MON_STOP_FG = 0x3878C0;   // monitor on + stopped: vivid blue
+  C_LINK_ON_BG     = 0x1A3A6A;   // linked fill
+  C_LINK_ON_FG     = 0x88BBFF;   // linked icon
+  C_LINK_OFF_BG    = 0x141420;   // unlinked bg
+  C_LINK_OFF_FG    = 0x3A3A58;   // unlinked icon
+  C_MULT_LABEL     = 0xDDEEFF;   // multiplier text active
+  C_MULT_INACTIVE  = 0x3A3A50;   // multiplier text empty
+  C_PILL_ON_DOT    = 0x30DD80;   // topbar ON dot
+  C_PILL_OFF_DOT   = 0x404050;   // topbar OFF dot
+  C_PILL_LABEL     = 0x909090;   // topbar label text
+  C_PILL_VALUE     = 0xFFFFFF;   // topbar value text
+  // ────────────────────────────────────────────────────────────────────────────
 );
 
 @slider
@@ -3417,39 +3455,9 @@ function draw(ixpos, ypos) local(i gap rec mode force_redraw
   pair_wantr mon_hit_y mon_hit_h mon_hit_rec
   tun_x tun_mx tun_my tun_on tun_icon_sz tun_icon_x tun_icon_y tun_hit_y tun_hit_h tun_hit_lane_idx)
 (
-  // ── Ultra8 Design Palette ─────────────────────────────────────────────────────
-  C_BG_BASE        = 0x13171C;   // overall background
-  C_BG_TOPBAR      = 0x13171C;   // top bar background
-  C_LANE_REC       = 0x2B1415;   // recording/overdub: dark red
-  C_LANE_PLAY      = 0x152116;   // playing: dark green
-  C_LANE_STOP_CONT = 0x13171C;   // stopped with content: main UI
-  C_LANE_EMPTY     = 0x13171C;   // empty lane: main UI
-  C_CONT_REC       = 0x44191B;   // recording highlight
-  C_CONT_PLAY      = 0x1F341C;   // playback highlight
-  C_CONT_STOP      = 0x1D242C;   // stopped contour: main UI highlight
-  C_CONT_SEL       = 0x7080E0;   // selected contour
-  C_WAVE_TROUGH    = 0x0E0E1E;   // waveform sub-panel bg
-  C_WAVE_PLAYED    = 0xCCCCCC;   // played: near-white
-  C_WAVE_UNPLAYED  = 0x787C98;   // unplayed: mid cool-grey
-  C_PROG_PLAY      = 0x1F341C;   // playing progress fill (playback highlight)
-  C_PROG_REC       = 0x44191B;   // recording progress fill (recording highlight)
-  C_PROG_STOP      = 0x1D242C;   // stopped progress fill (main UI highlight)
-  C_MON_OFF_BG  = 0x0C0C12;   // monitor off: near-black bg
-  C_MON_OFF_FG  = 0x2A2A3C;   // monitor off: barely-visible border + icon
-  C_MON_REC_FG  = 0xD83535;   // monitor on + recording: vivid red
-  C_MON_PLAY_FG = 0x35D050;   // monitor on + playing: vivid green
-  C_MON_STOP_FG = 0x3878C0;   // monitor on + stopped: vivid blue
-  C_LINK_ON_BG     = 0x1A3A6A;   // linked fill
-  C_LINK_ON_FG     = 0x88BBFF;   // linked icon
-  C_LINK_OFF_BG    = 0x141420;   // unlinked bg
-  C_LINK_OFF_FG    = 0x3A3A58;   // unlinked icon
-  C_MULT_LABEL     = 0xDDEEFF;   // multiplier text active
-  C_MULT_INACTIVE  = 0x3A3A50;   // multiplier text empty
-  C_PILL_ON_DOT    = 0x30DD80;   // topbar ON dot
-  C_PILL_OFF_DOT   = 0x404050;   // topbar OFF dot
-  C_PILL_LABEL     = 0x909090;   // topbar label text
-  C_PILL_VALUE     = 0xFFFFFF;   // topbar value text
-  // ────────────────────────────────────────────────────────────────────────────
+  // Ultra8 Design Palette (C_BG_*, C_LANE_*, C_PILL_*, etc.) is set once in
+  // @init — it must exist before draw_topbar()'s first call, which happens
+  // before this function runs on every @gfx frame. See @init for the block.
 
   force_redraw = gfx_w != last_w || gfx_h != last_h ||
     lasthalve != cfgp_fade[] || lastlen != g_length ||
